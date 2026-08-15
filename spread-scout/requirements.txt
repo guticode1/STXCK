@@ -1,3 +1,6 @@
-streamlit>=1.45
+# Pinned to a minor series on purpose: the UI targets Streamlit internals via
+# [data-testid] selectors, which are not a public API and can move between
+# releases. Verified against 1.57.0. See assets/styles.css header note.
+streamlit==1.57.*
 pandas>=2.0
 requests>=2.31

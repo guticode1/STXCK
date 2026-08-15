@@ -1,0 +1,12 @@
+# secrets — never commit these (see CLAUDE.md)
+.streamlit/secrets.toml
+secrets.toml
+
+# python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# os
+.DS_Store
