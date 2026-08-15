@@ -66,4 +66,23 @@ it to the internet.
   The screener measures reward; the vega, and the crash-shaped loss profile,
   are the price of it.
 
+## Notes on the interface
+
+- All styling lives in `assets/styles.css`, injected once per run. It is a
+  token system: change the palette, spacing scale, or type roles at the top of
+  that file and the whole app follows.
+- Rules marked `[ST]` in the stylesheet target Streamlit's internal DOM through
+  `[data-testid="..."]` selectors and the `.st-key-<widget key>` class. Neither
+  is a public API, so `requirements.txt` pins `streamlit==1.57.*`. If you
+  unpin and the layout breaks, those rules are where to look — the stylesheet
+  header lists every fragile selector.
+- Two Streamlit quirks the code works around, both verified on 1.57:
+  `st.html` sanitizes with DOMPurify and drops `<style>` and inline `<svg>`
+  (so CSS and the payoff diagram go through `st.markdown`), and inline scripts
+  must not contain a `<` character or the HTML parser mangles them.
+- The payoff diagram overlays a ±1σ expected-move cone on the profit/loss
+  profile. In the sidebar it is schematic (assumed 35% IV, $100 stock, drawn at
+  your minimum return on risk); in a row's detail panel it uses that contract's
+  real implied vol. The labels say which.
+
 This is a screening tool, not investment advice.
