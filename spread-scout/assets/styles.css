@@ -65,6 +65,14 @@ button, input, textarea, select, [class^="st-"], [class*=" st-"] {
 .mono, .num { font-family: var(--mono) !important;
   font-variant-numeric: tabular-nums; font-feature-settings:'tnum' 1; }
 
+/* Must come AFTER the override above: Streamlit renders icons as ligature text
+   ("arrow_drop_down") in an icon font. Forcing our UI face onto them prints the
+   ligature name as literal words. [ST] */
+[data-testid="stIconMaterial"], .material-icons, [class*="material-symbols"],
+[data-testid="stExpanderIcon"], span[data-baseweb="icon"] {
+  font-family: 'Material Symbols Rounded', 'Material Icons' !important;
+}
+
 /* ----------------------------------------------------------------- shell */
 
 .stApp {
@@ -158,10 +166,14 @@ h1, h2, h3, .display { font-family: var(--display) !important;
 
 /* --------------------------------------------------------------- sidebar */
 
+/* Default sidebar (~244px) is too narrow for chips + preset grid; the labels
+   wrapped to one letter per line. [ST] */
 [data-testid="stSidebar"] {
   background: linear-gradient(180deg, #0F141D 0%, #0C1017 100%);
   border-right: 1px solid var(--hairline);
+  width: 348px !important; min-width: 348px !important;
 }
+[data-testid="stSidebar"][aria-expanded="false"] { min-width: 0 !important; }
 [data-testid="stSidebarUserContent"] { padding: var(--s4) var(--s4) 0 var(--s4); }
 [data-testid="stSidebarCollapseButton"] button { color: var(--muted); }
 
@@ -265,23 +277,20 @@ h1, h2, h3, .display { font-family: var(--display) !important;
 [data-testid="stMultiSelect"] [data-baseweb="select"] > div:first-child::-webkit-scrollbar-thumb {
   background: var(--hairline); border-radius: 3px; }
 
-/* [ST] pills (presets + quick filters): active state = amber outline */
-[data-testid="stPills"] button, [data-testid="stButtonGroup"] button {
+/* [ST] pills + segmented control. The active hook is NOT aria-checked — it is
+   a separate testid/kind suffixed "Active" (verified 1.57.0). */
+[data-testid^="stBaseButton-pills"],
+[data-testid^="stBaseButton-segmented_control"] {
   font-size: 11.5px !important; border-radius: 6px !important;
   border: 1px solid var(--hairline) !important; background: var(--slab) !important;
   color: var(--muted) !important; transition: all 130ms var(--ease);
 }
-[data-testid="stPills"] button:hover, [data-testid="stButtonGroup"] button:hover {
+[data-testid^="stBaseButton-pills"]:hover,
+[data-testid^="stBaseButton-segmented_control"]:hover {
   color: var(--text) !important; border-color: var(--amber-dim) !important;
   transform: translateY(-1px); }
-[data-testid="stPills"] button[aria-checked="true"],
-[data-testid="stButtonGroup"] button[aria-checked="true"],
-[data-testid="stPills"] button[kind="pillsActive"] {
-  background: rgba(224,167,44,.12) !important; color: var(--amber) !important;
-  border-color: var(--amber) !important; }
-
-/* segmented control [ST] */
-[data-testid="stSegmentedControl"] button[aria-checked="true"] {
+[data-testid="stBaseButton-pillsActive"],
+[data-testid="stBaseButton-segmented_controlActive"] {
   background: rgba(224,167,44,.12) !important; color: var(--amber) !important;
   border-color: var(--amber) !important; }
 
@@ -290,11 +299,20 @@ h1, h2, h3, .display { font-family: var(--display) !important;
 
 /* ---------------------------------------------------- run button (sticky) */
 
-.st-key-run_scan {
-  position: sticky; bottom: 0; z-index: 20;
-  padding: var(--s3) 0 var(--s4) 0; margin-top: var(--s2);
-  background: linear-gradient(180deg, rgba(12,16,23,0) 0%, #0C1017 28%);
+/* Pinned run block. position:sticky cannot work here — the run box is the last
+   child, so there is no room below it to stick against. Fixed positioning is
+   scoped to the sidebar; Streamlit collapses the sidebar with a transform,
+   which creates a containing block, so this travels with it. [ST] */
+[data-testid="stSidebar"] .st-key-runbox {
+  position: fixed; bottom: 0; z-index: 30;
+  /* matches the measured content column inside the 348px sidebar (elements sit
+     at left:38, width:271); no `left` so it keeps its static x position */
+  width: 271px;
+  padding: var(--s4) 0 var(--s3) 0;
+  background: linear-gradient(180deg, rgba(12,16,23,0) 0%, #0C1017 22%);
 }
+/* keep the last section clear of the pinned block */
+[data-testid="stSidebarUserContent"] { padding-bottom: 104px !important; }
 .st-key-run_scan button {
   background: var(--amber) !important; color: #14100A !important;
   border: 0 !important; border-radius: 9px !important;
@@ -316,6 +334,14 @@ h1, h2, h3, .display { font-family: var(--display) !important;
   background: var(--slab) !important; color: var(--text) !important;
   border: 1px solid var(--hairline) !important; border-radius: 8px !important;
   font-size: 12px !important; transition: all 130ms var(--ease);
+}
+/* sidebar buttons must never wrap a label onto a second line ("Defa/ults") */
+[data-testid="stSidebar"] .stButton button {
+  font-size: 11.5px !important; padding: 7px 8px !important; min-height: 34px;
+}
+[data-testid="stSidebar"] .stButton button p {
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  font-size: 11.5px !important;
 }
 .stButton button:hover, .stDownloadButton button:hover {
   border-color: var(--amber-dim) !important; transform: translateY(-1px); }
@@ -460,7 +486,9 @@ svg.payoff .kmark { stroke: var(--muted); stroke-dasharray: 2 3; opacity: .75; }
 svg.payoff .cone { fill: rgba(110,168,255,.10); stroke: rgba(110,168,255,.35);
   stroke-dasharray: 3 3; }
 svg.payoff .spot { stroke: var(--text); opacity: .55; }
-svg.payoff text { font-family: var(--mono); font-size: 8.5px; fill: var(--muted); }
+/* size comes from the svg element (set per context in payoff_svg) so labels
+   stay legible whether the diagram is 292px or 600px wide */
+svg.payoff text { font-family: var(--mono); font-size: inherit; fill: var(--muted); }
 svg.payoff text.val { fill: var(--text); }
 svg.payoff .draw { stroke-dasharray: 620; stroke-dashoffset: 620;
   animation: draw 340ms var(--ease) forwards; }
