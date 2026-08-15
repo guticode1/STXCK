@@ -42,8 +42,9 @@ import requests
 import streamlit as st
 
 from strategy import (
-    BLOCK_REASON, ETF_BLOCKLIST, Params, build_spreads, earnings_in_window,
-    is_blocked, rank_cross_regime, rank_within_regime, rv_from_closes,
+    BLOCK_REASON, ETF_BLOCKLIST, Params, RANK_METRICS, alternates_for,
+    build_spreads, dedupe, earnings_in_window, is_blocked, market_session,
+    prob_otm, rank_cross_regime, rank_within_regime, rv_from_closes,
     valid_quote,
 )
 
@@ -213,14 +214,22 @@ def spot_prices(tickers: tuple[str, ...]) -> dict[str, float]:
     return out
 
 
-@st.cache_data(ttl=600, show_spinner=False)
-def put_chain(ticker: str, exp_gte: str, exp_lte: str,
-              k_lo: float, k_hi: float) -> pd.DataFrame:
+@st.cache_data(show_spinner=False)
+def put_chain(ticker: str, exp_gte: str, exp_lte: str, k_lo: float, k_hi: float,
+              is_open: bool, session_day: str, _ttl_bucket: int) -> pd.DataFrame:
     """All puts for one underlying inside an expiry window and strike band.
 
-    Emits both a strict midpoint price (`mid`, NaN when there is no usable
-    two-sided market) and a permissive one (`px_fallback`). The screener always
-    tags which was used; the UI excludes last-trade rows by default.
+    Emits ONE price per contract (`px`) chosen by market session, plus the
+    provenance needed to refuse incoherent pairs:
+
+      px_src   "mid"   live two-sided quote
+               "close" that session's mark, used only when the market is shut
+      mark_day the session the mark belongs to
+
+    day.close is ZERO-FILLED by the feed for a contract that did not trade, so
+    a 0 there means "no mark", not "worth nothing". Treating it as a price is
+    what let a 15-wide spread appear to pay 11.85: the liquid leg carried a
+    real mark and the illiquid one carried 0.
     """
     rows, url_params = [], {
         "contract_type": "put",
@@ -230,25 +239,42 @@ def put_chain(ticker: str, exp_gte: str, exp_lte: str,
     data = _get(f"/v3/snapshot/options/{ticker}", url_params)
     while True:
         for c in data.get("results", []):
-            det, day = c.get("details", {}), c.get("day", {})
-            quote_, greeks = c.get("last_quote", {}) or {}, c.get("greeks", {}) or {}
+            det, day = c.get("details", {}) or {}, c.get("day", {}) or {}
+            quote_ = c.get("last_quote", {}) or {}
+            greeks = c.get("greeks", {}) or {}
+            trade = c.get("last_trade", {}) or {}
             bid, ask = quote_.get("bid"), quote_.get("ask")
             ok = valid_quote(bid, ask)
             mid = (bid + ask) / 2 if ok else None
+
+            # a zero close is an absent mark, not a zero price
+            close_px = trade.get("price") or day.get("close")
+            if not close_px or close_px <= 0:
+                close_px = None
+            mark_day = _mark_day(trade, day, session_day)
+
+            if is_open:
+                px, src = (mid, "mid") if ok else (None, None)
+            elif ok:
+                px, src = mid, "mid"
+            elif close_px:
+                px, src = close_px, "close"
+            else:
+                px, src = None, None
+
             rows.append({
                 "ticker": ticker,
                 "exp": det.get("expiration_date"),
                 "strike": det.get("strike_price"),
-                "mid": mid,                       # midpoint, only when tradable
-                "last": day.get("close"),         # stale print, never preferred
+                "px": px, "px_src": src, "mark_day": mark_day,
                 "bid": bid, "ask": ask,
-                # market width as a fraction of mid; None when there is no market
                 "ba_pct": ((ask - bid) / mid) if ok and mid > 0 else None,
                 "delta": greeks.get("delta"),
                 "iv": c.get("implied_volatility"),
                 "vega": greeks.get("vega"),
                 "oi": c.get("open_interest") or 0,
                 "vol": day.get("volume") or 0,
+                "spc": det.get("shares_per_contract"),
             })
         nxt = data.get("next_url")
         if not nxt:
@@ -258,9 +284,19 @@ def put_chain(ticker: str, exp_gte: str, exp_lte: str,
     df = pd.DataFrame(rows)
     if df.empty:
         return df
-    df["px_src"] = df["mid"].notna().map({True: "mid", False: "last"})
-    df["px_fallback"] = df["mid"].fillna(df["last"])
-    return df.dropna(subset=["px_fallback", "strike", "exp"])
+    return df.dropna(subset=["px", "strike", "exp"])
+
+
+def _mark_day(trade: dict, day: dict, session_day: str) -> str | None:
+    """Which session a mark belongs to, from the last trade's timestamp."""
+    ts = trade.get("sip_timestamp") or trade.get("t")
+    if ts:
+        try:
+            secs = ts / 1e9 if ts > 1e15 else ts / 1e3
+            return dt.datetime.fromtimestamp(secs).date().isoformat()
+        except (TypeError, ValueError, OSError):
+            pass
+    return session_day if (day.get("close") or 0) > 0 else None
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -655,6 +691,24 @@ with st.sidebar:
         min_ror = st.slider("Min return on risk (%)", 0, 40, 5, key="min_ror")
         min_width = st.number_input("Min spread width", 1.0, 50.0, 2.5, 0.5,
                                     key="min_width")
+        min_prem = st.number_input(
+            "Min net premium", 0, 5000, 200, 25, key="min_prem",
+            help="Applied to the POSITION total: credit x 100 x contracts. "
+                 "At 20% OTM this thins the 30-45 day sleeve hard, which is "
+                 "the informative outcome — only high-IV names clear it.")
+        # POP and short delta are two expressions of the same constraint, so
+        # moving one shows the other's implied value.
+        min_pop = st.slider("Min probability of profit (%)", 50, 99, 80,
+                            key="min_pop",
+                            help="N(d2) of the short strike.")
+        max_delta = st.slider("Max short-leg |delta|", 5, 50, 15, key="max_delta",
+                              help="The market's rough proxy for P(ITM). "
+                                   "Roughly equivalent to a "
+                                   f"{100 - 15}% probability of profit.")
+        st.html('<p class="helper" style="margin-top:-4px">'
+                f'POP {min_pop}% implies |&#916;| near {(100 - min_pop) / 100:.2f}; '
+                f'the delta cap is set to {max_delta / 100:.2f}. '
+                'Whichever binds first wins.</p>')
 
         # live payoff preview — the shape of the worst trade you'd accept
         prev_spot = 100.0
@@ -690,15 +744,22 @@ with st.sidebar:
         min_oi_l = st.number_input("Min OI, long leg", 0, 50000, 100, 50,
                                    key="min_oi_l")
         max_ba = st.slider("Max bid/ask width (% of mid)", 5, 100, 40, key="max_ba")
-        exclude_last = st.toggle(
-            "Exclude last-trade pricing", value=True, key="exclude_last",
-            help="On by default. A far-OTM strike with no bid still carries a "
-                 "stale last print; pricing off it manufactures spreads that "
-                 "look excellent and cannot be filled. Turn this off to see "
-                 "them — they stay flagged and rank below quoted spreads.")
+        max_cred_pct = st.slider(
+            "Max credit as % of width", 10, 60, 35, key="max_cred_pct",
+            help="The sanity gate. A credit worth most of the width at 20% "
+                 "OTM is a broken quote, not a market — this is what rejects "
+                 "the 15-wide spread that appeared to pay 11.85.")
+        max_per_name = st.number_input(
+            "Max candidates per underlying", 1, 10, 2, 1, key="max_per_name",
+            help="Concentration control, so one high-IV name cannot own the "
+                 "table.")
+        use_min_ev = st.toggle("Require positive expected value", value=False,
+                               key="use_min_ev",
+                               help="Opt-in. Uses the realized-vol basis.")
 
         strict = (min(min_oi_s / 1500, 1) + min(min_oi_l / 800, 1)
-                  + min((100 - max_ba) / 80, 1) + (1 if exclude_last else 0)) / 4
+                  + min((100 - max_ba) / 80, 1)
+                  + min((60 - max_cred_pct) / 50, 1)) / 4
         lit = max(1, round(strict * 5))
         st.html('<div class="meter"><span>loose</span><span class="meter-track">'
                 + "".join(f'<i class="meter-seg{" on" if i < lit else ""}"></i>'
@@ -726,10 +787,19 @@ with st.sidebar:
                 f' · est {max(1, round(n_chains * 0.45 / 60)):d}–'
                 f'{max(2, round(n_chains * 1.1 / 60)):d} min</div>')
 
+SESSION = market_session()
+MARKET_OPEN = SESSION["state"] == "open"
+
 params = Params(otm_lo=otm_band[0] / 100, otm_hi=otm_band[1] / 100,
                 risk_cap=risk_cap, min_ror=min_ror,
                 min_oi_short=min_oi_s, min_oi_long=min_oi_l,
-                max_spread_pct=max_ba / 100, min_width=min_width)
+                max_spread_pct=max_ba / 100, min_width=min_width,
+                max_credit_pct=max_cred_pct / 100,
+                min_net_premium=float(min_prem),
+                min_pop=min_pop / 100, max_short_delta=max_delta / 100,
+                min_ev=0.0 if use_min_ev else None,
+                max_per_underlying=int(max_per_name),
+                market_open=MARKET_OPEN)
 
 windows = []
 if use_short:
@@ -808,7 +878,7 @@ def run_scan() -> dict:
     the tape: each name reports as it resolves.
     """
     spots = spot_prices(tuple(universe))
-    notes, tape = [], []
+    notes, tape, rejects = [], [], {}
     missing = [t for t in universe if t not in spots]
     if missing:
         notes.append(f"No spot price for {', '.join(missing)} — skipped.")
@@ -818,7 +888,11 @@ def run_scan() -> dict:
     if not work:
         return {"results": pd.DataFrame(), "notes": notes + [
             "No spot prices returned for any ticker — check the data feed."],
-            "at": dt.datetime.now().strftime("%b %d · %H:%M"), "params": {}}
+            "at": dt.datetime.now().strftime("%b %d · %H:%M"), "params": {},
+            "rejects": {}, "session": SESSION}
+
+    session_day = SESSION["last_session"].isoformat()
+    ttl_bucket = int(time.time() // (600 if MARKET_OPEN else 3600))
 
     bar = st.progress(0.0, text="Starting scan…")
     tape_slot, skel_slot = st.empty(), st.empty()
@@ -828,10 +902,11 @@ def run_scan() -> dict:
         bar.progress(i / len(work), text=f"Fetching {t} chains · {label} "
                                          f"· {i + 1} of {len(work)}")
         spot = spots[t]
-        k_lo = (1 - params.otm_hi) * spot - risk_cap / 100 - 5   # room for long legs
+        k_lo = (1 - params.otm_hi) * spot - risk_cap / 100 - 5
         k_hi = (1 - params.otm_lo) * spot + 1
         try:
-            chain = put_chain(t, d0.isoformat(), d1.isoformat(), k_lo, k_hi)
+            chain = put_chain(t, d0.isoformat(), d1.isoformat(), k_lo, k_hi,
+                              MARKET_OPEN, session_day, ttl_bucket)
         except requests.HTTPError as e:
             notes.append(f"{t}: chain fetch failed ({e.response.status_code}).")
             tape.append((t, 0, "err", label))
@@ -843,7 +918,9 @@ def run_scan() -> dict:
             continue
         dte_of = {e: (dt.date.fromisoformat(e) - today).days
                   for e in chain["exp"].unique()}
-        spreads = build_spreads(chain, spot, dte_of, params)
+        rv = realized_vol(t)          # needed before pricing: EV uses it
+        spreads = build_spreads(chain, spot, dte_of, params, rv=rv,
+                                rejects=rejects)
         if not spreads.empty:
             spreads.insert(1, "window", label)
             all_rows.append(spreads)
@@ -854,22 +931,15 @@ def run_scan() -> dict:
 
     df = pd.concat(all_rows, ignore_index=True) if all_rows else pd.DataFrame()
 
-    # ---- volatility and event context, one call per surviving underlying
     earn_source = ""
     if not df.empty:
         names = sorted(df["ticker"].unique())
-        bar.progress(1.0, text=f"Volatility and events · {len(names)} names")
-        rv_map, earn_map = {}, {}
+        bar.progress(1.0, text=f"Events · {len(names)} names")
+        earn_map = {}
         for t in names:
-            rv_map[t] = realized_vol(t)
             dates, src = earnings_dates(t)
             earn_map[t] = dates
             earn_source = earn_source or src
-        df["rv30"] = df["ticker"].map(lambda t: rv_map.get(t))
-        df["iv_rv"] = [
-            round(iv / rv, 2) if (iv and rv and rv > 0) else None
-            for iv, rv in zip(df["short_iv"], df["rv30"])]
-        df["rv30"] = df["rv30"].map(lambda v: round(v, 3) if v else None)
         df["earnings_in_window"] = [
             earnings_in_window(earn_map.get(t, []), today,
                                dt.date.fromisoformat(e))
@@ -882,10 +952,13 @@ def run_scan() -> dict:
     bar.empty(); tape_slot.empty(); skel_slot.empty()
     return {"results": df, "notes": notes, "earn_source": earn_source,
             "at": dt.datetime.now().strftime("%b %d · %H:%M"),
+            "rejects": rejects, "session": SESSION,
             "params": {"min_ror": min_ror, "otm": tuple(otm_band),
                        "risk_cap": risk_cap, "min_oi_s": min_oi_s,
                        "max_ba": max_ba, "min_width": min_width,
-                       "exclude_last": exclude_last}}
+                       "min_prem": min_prem, "min_pop": min_pop,
+                       "max_cred_pct": max_cred_pct,
+                       "max_per_name": int(max_per_name)}}
 
 
 if run:
@@ -962,19 +1035,25 @@ if results.empty:
 # ---------------------------------------------------------------- metrics
 
 
-def metrics_html(df: pd.DataFrame, excluded: int, animate: bool) -> str:
-    """Strip above the table. `df` is what survives the pricing filter;
-    `excluded` is how many candidates were dropped for stale pricing."""
-    med, best = df["ror_pct"].median(), df["ror_pct"].max()
-    best_ann = df["annualized_pct"].max()
+def metrics_html(df: pd.DataFrame, rejected: int, animate: bool) -> str:
+    """Strip above the table. `rejected` is how many candidate pairs the sanity
+    gate refused to construct — surfaced, never silently dropped."""
+    med = df["ror_pct"].median() if len(df) else 0
+    best = df["ror_pct"].max() if len(df) else 0
+    best_ann = df["annualized_pct"].max() if len(df) else 0
+    pop_med = 100 * df["pop"].median() if df.get("pop") is not None \
+        and df["pop"].notna().any() else 0
+    ev_best = df["ev_adj"].max() if df.get("ev_adj") is not None \
+        and df["ev_adj"].notna().any() else 0
     with_earn = int((df["earnings_in_window"] > 0).sum()) \
         if "earnings_in_window" in df.columns else 0
     tiles = [("candidates", len(df), 0, "", ""),
+             ("median POP", pop_med, 1, "", "%"),
              ("median RoR", med, 1, "", "%"),
              ("best RoR", best, 1, "", "%"),
-             ("best annualized", best_ann, 0, "", "%"),
+             ("best EV (RV basis)", ev_best, 0, "$", ""),
              ("earnings in window", with_earn, 0, "", ""),
-             ("excluded · stale price", excluded, 0, "", "")]
+             ("rejected by gate", rejected, 0, "", "")]
     cards = ""
     for label, val, dec, pre, suf in tiles:
         shown = f"{pre}{val:,.{dec}f}{suf}"
@@ -1037,27 +1116,42 @@ def metrics_html(df: pd.DataFrame, excluded: int, animate: bool) -> str:
 
 # Stale-priced rows are excluded by default; the count is reported, never
 # silently dropped.
-exclude_last_now = scan.get("params", {}).get("exclude_last", True)
-n_stale = int((results["pricing"] == "last").sum())
-shown = results[results["pricing"] == "mid"] if exclude_last_now else results
-stale_fallback = bool(exclude_last_now and n_stale and shown.empty)
-if stale_fallback:
-    shown = results          # nothing survives the filter; show the flagged rows
-# When the fallback fires those rows are on screen, so reporting them as
-# excluded would have the strip contradict the table underneath it.
-n_excluded = n_stale if (exclude_last_now and not stale_fallback) else 0
+# Everything that survives the sanity gate is a real candidate now — stale
+# marks are rejected at construction rather than filtered afterwards.
+shown = results
+sess = scan.get("session") or {}
+rejects = scan.get("rejects") or {}
+n_rejected = sum(rejects.values())
+
+if sess.get("state") == "closed":
+    nxt = sess.get("next_open")
+    nxt_txt = nxt.strftime("%a %-d %b, %-I:%M %p ET") if nxt else "the next session"
+    last = sess.get("last_session")
+    st.html(
+        '<div class="banner banner-info">'
+        '<span class="banner-k">Markets closed</span>'
+        f'<span>Quotes are {last.strftime("%A %-d %b") if last else "the last session"}'
+        "'s close. Results are for planning, not execution — verify against a "
+        'live quote before trading.</span>'
+        f'<span class="banner-x">Next open {esc(nxt_txt)}</span></div>')
+else:
+    st.html('<div class="banner banner-live"><span class="banner-k">Live</span>'
+            '<span>Priced from two-sided quotes. Strikes without a live market '
+            'are rejected, not ranked.</span></div>')
+
 animate = st.session_state.get("metrics_seen") != scan["at"]
-st.html(metrics_html(shown, n_excluded, animate),
-        unsafe_allow_javascript=animate)
+st.html(metrics_html(shown, n_rejected, animate), unsafe_allow_javascript=animate)
 st.session_state["metrics_seen"] = scan["at"]
-st.html(f'<p class="payoff-note" style="margin:6px 0 18px 2px">scan completed '
-        f'{esc(scan["at"])} · {len(shown):,} candidates shown'
-        + (f' · {n_excluded:,} excluded for stale last-trade pricing'
-           if n_excluded else '')
-        + (' · every candidate is stale-priced, so the pricing filter is '
-           'showing them rather than an empty table — treat each as unfillable '
-           'until you check a live quote' if stale_fallback else '')
-        + ' · sleeves are ranked separately</p>')
+
+if rejects:
+    with st.expander(f"Sanity gate rejected {n_rejected:,} candidate pairs"):
+        st.html('<p class="helper">Every pair the gate refused to construct, '
+                'by reason. These are not hidden results — they are pairs '
+                'whose quotes did not describe a tradable spread.</p>'
+                '<div class="ledger">' + "".join(
+                    f'<span>{esc(k)}<b>{v:,}</b></span>'
+                    for k, v in sorted(rejects.items(), key=lambda kv: -kv[1]))
+                + '</div>')
 
 # ---------------------------------------------------------------- results
 
@@ -1077,24 +1171,55 @@ def order_ticket(row: pd.Series) -> str:
 
 
 QUICK = {
-    "RoR > 10%": lambda d: d["ror_pct"] > 10,
+    "POP ≥ 85%": lambda d: d["pop"].fillna(0) >= 0.85,
     "No earnings in window": lambda d: d.get("earnings_in_window",
                                              pd.Series(0, index=d.index)) == 0,
     "Tight markets only": lambda d: (d["short_ba_pct"].fillna(999) <= 20)
                                     & (d["long_ba_pct"].fillna(999) <= 20),
-    "Width \u2265 $5": lambda d: d["width"] >= 5,
-    "Exclude last-trade": lambda d: d["pricing"] == "mid",
+    "Width ≥ $5": lambda d: d["width"] >= 5,
+    "Positive EV (RV)": lambda d: d["ev_adj"].fillna(-1e9) > 0,
 }
 
-TABLE_COLS = ["sector", "ticker", "spot", "exp", "dte", "legs", "pct_otm",
-              "width", "credit", "max_loss", "contracts", "total_credit",
-              "ror_pct", "annualized_pct", "earn", "iv_rv", "short_iv", "rv30",
-              "ba_worst", "short_oi", "long_oi", "priced"]
+# Eight columns drive the decision; the rest are opt-in via the column control.
+CORE_COLS = ["ticker", "legs", "dte", "credit", "max_loss", "pop",
+             "ev_per_collateral", "ror_pct"]
+EXTRA_COLS = ["spot", "exp", "pct_otm", "width", "credit_pct_width",
+              "contracts", "total_credit", "annualized_pct", "short_delta",
+              "p_touch", "ev_adj", "ev_rn", "short_iv", "rv30", "iv_minus_rv",
+              "earn", "ba_worst", "short_oi", "long_oi", "priced"]
 
 
 def table_config(disp: pd.DataFrame, cross: bool) -> dict:
+    ror_cap = float(disp["ror_pct"].quantile(0.95)) if len(disp) else 1.0
     return {
-        "sector": st.column_config.ImageColumn("", width=36, help="Sector"),
+        "pop": st.column_config.NumberColumn(
+            "POP", format="percent",
+            help="N(d2): probability the short strike expires out of the "
+                 "money. Not the same as 1 - |delta|."),
+        "ev_per_collateral": st.column_config.NumberColumn(
+            "EV / $ risk", format="%.3f",
+            help="Expected value per dollar of collateral, on the REALIZED-vol "
+                 "basis. Priced with chain IV, EV is ~0 by construction; the "
+                 "gap is the variance risk premium this strategy harvests."),
+        "ev_adj": st.column_config.NumberColumn(
+            "EV (RV basis)", format="$%.0f",
+            help="Assumes the terminal distribution follows realized vol, not "
+                 "implied. That assumption is the edge — and it is an "
+                 "assumption."),
+        "ev_rn": st.column_config.NumberColumn(
+            "EV (IV basis)", format="$%.0f",
+            help="Risk-neutral baseline. Expect ~0 minus costs."),
+        "p_touch": st.column_config.NumberColumn(
+            "P(touch)", format="percent",
+            help="Approximate: 2 x N(-d2), driftless."),
+        "short_delta": st.column_config.NumberColumn("Δ short", format="%.3f"),
+        "credit_pct_width": st.column_config.NumberColumn(
+            "Cr/width", format="%.0f%%",
+            help="Credit as a share of width. The sanity gate lives here."),
+        "iv_minus_rv": st.column_config.NumberColumn(
+            "IV−RV", format="%.2f",
+            help="Positive means implied exceeds realized — the premium is "
+                 "richer than how the stock has actually moved."),
         "ticker": st.column_config.TextColumn("Ticker", width="small"),
         "spot": st.column_config.NumberColumn("Spot", format="$%.2f"),
         "exp": st.column_config.TextColumn("Expiry", width="small"),
@@ -1189,7 +1314,19 @@ def render_results(df: pd.DataFrame, slot: str, cross: bool,
     if df.empty:
         st.html('<div class="panel"><p class="sub">Nothing in this sleeve.</p></div>')
         return
-    ranked = rank_cross_regime(df) if cross else rank_within_regime(df)
+    metric = st.session_state.get("rank_metric", "EV per $ collateral")
+    if cross:
+        ranked = rank_cross_regime(df)
+    else:
+        col, asc = RANK_METRICS.get(metric, ("ror_pct", False))
+        if col in df.columns and df[col].notna().any():
+            ranked = df.sort_values(col, ascending=asc,
+                                    na_position="last").reset_index(drop=True)
+        else:
+            ranked = rank_within_regime(df)
+    alternates = ranked
+    ranked = dedupe(ranked, "Annualized RoR" if cross else metric,
+                    scan.get("params", {}).get("max_per_name", 2))
 
     st.html(
         '<p class="payoff-note" style="margin:2px 0 10px 2px">'
@@ -1202,9 +1339,13 @@ def render_results(df: pd.DataFrame, slot: str, cross: bool,
 
     picks = st.pills("Quick filters", list(QUICK), selection_mode="multi",
                      key=f"qf_{slot}", label_visibility="collapsed")
-    tick_pick = st.multiselect("Tickers", sorted(ranked["ticker"].unique()),
+    c1, c2 = st.columns([1, 1])
+    tick_pick = c1.multiselect("Tickers", sorted(ranked["ticker"].unique()),
                                key=f"tk_{slot}", placeholder="All tickers",
                                label_visibility="collapsed")
+    show_all = c2.toggle("All columns", value=False, key=f"cols_{slot}",
+                         help="Default shows the eight columns that drive a "
+                              "decision.")
     view = ranked
     for q in picks or []:
         try:
@@ -1220,7 +1361,8 @@ def render_results(df: pd.DataFrame, slot: str, cross: bool,
         return
 
     disp = view.copy()
-    disp["sector"] = [dot_uri(sector_color(t)) for t in disp["ticker"]]
+    disp["sec"] = [SECTOR_META[sector_of(t)][0][:2].upper()
+                   for t in disp["ticker"]]
     disp["legs"] = (disp["short_k"].map("{:g}".format) + " / "
                     + disp["long_k"].map("{:g}".format))
     disp["priced"] = disp["pricing"].map({"mid": "mid", "last": "⚠ LAST"})
@@ -1235,8 +1377,10 @@ def render_results(df: pd.DataFrame, slot: str, cross: bool,
         if c not in disp.columns:
             disp[c] = None
 
+    cols = [c for c in (CORE_COLS + EXTRA_COLS if show_all else CORE_COLS)
+            if c in disp.columns]
     event = st.dataframe(
-        disp[TABLE_COLS], width="stretch", hide_index=True, height=460,
+        disp[cols], width="stretch", hide_index=True, height=460,
         key=f"tbl_{slot}", on_select="rerun", selection_mode="multi-row",
         column_config=table_config(disp, cross))
 
@@ -1327,6 +1471,11 @@ def _q(v) -> str:
 # separate tables. The cross-regime tab is the only place they are compared,
 # and only on annualized return.
 scan_otm = tuple(sparams.get("otm", tuple(otm_band)))
+
+rc1, rc2 = st.columns([1.2, 3])
+rc1.selectbox("Rank by", list(RANK_METRICS), key="rank_metric",
+              help="EV per $ collateral is the default because it is the only "
+                   "metric that does not systematically favour one sleeve.")
 present = [w for w in (WIN_SHORT, WIN_LONG) if w in set(shown["window"])]
 labels = list(present)
 if len(present) > 1:

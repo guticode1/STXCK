@@ -33,24 +33,31 @@ def check(name, got, want, tol=1e-9):
         FAILURES.append(name)
 
 
-def leg(strike, bid, ask, last=None, oi=1000, iv=0.45, delta=-0.05):
-    """One chain row shaped the way put_chain emits them."""
+def leg(strike, bid, ask, last=None, oi=1000, iv=0.45, delta=-0.05,
+        day="2026-08-14", spc=100):
+    """One chain row shaped the way put_chain emits them.
+
+    `last` stands in for a session close mark used when the market is shut;
+    a zero there means "no mark", which the gate must refuse to price.
+    """
     ok = valid_quote(bid, ask)
     mid = quote_mid(bid, ask)
+    px = mid if ok else last
     return {
         "ticker": "TEST", "exp": EXP, "strike": float(strike),
-        "mid": mid, "last": last, "bid": bid, "ask": ask,
+        "px": px, "px_src": "mid" if ok else "close", "mark_day": day,
+        "bid": bid, "ask": ask,
         "ba_pct": ((ask - bid) / mid) if ok and mid else None,
-        "delta": delta, "iv": iv, "oi": oi, "vol": 100,
-        "px_src": "mid" if ok else "last",
-        "px_fallback": mid if ok else last,
+        "delta": delta, "iv": iv, "oi": oi, "vol": 100, "spc": spc,
     }
 
 
 def params(**kw):
+    """Permissive by default so each test isolates the one gate it targets."""
     base = dict(otm_lo=0.18, otm_hi=0.22, risk_cap=2200.0, min_ror=5.0,
                 min_oi_short=100, min_oi_long=100, max_spread_pct=0.40,
-                min_width=2.5)
+                min_width=2.5, max_credit_pct=0.35, min_net_premium=0.0,
+                min_pop=0.0, max_short_delta=1.0, market_open=True)
     base.update(kw)
     return Params(**base)
 
@@ -86,34 +93,42 @@ check("pricing tag", r["pricing"], "mid")
 # ------------------------------------------------------- phantom candidate
 
 print("\n2. Phantom candidate — long leg has NO bid but a stale last print")
-# Short 80 quoted 0.95/1.05 -> mid 1.00.
-# Long 75 has bid 0, ask 0.10, and a stale last of 0.02.
-#   Pricing off the stale print: credit = 1.00 - 0.02 = 0.98
-#     -> max_loss 402, ror 24.4%  (looks superb, cannot be filled)
-#   Correct handling: the long leg has no valid quote, so the spread is
-#   tagged `last` and excluded by default.
+# Short 80 quoted 0.95/1.05 -> mid 1.00. Long 75 has bid 0, ask 0.10 and a
+# stale last of 0.02. Pricing off the stale print gives credit 0.98 and a
+# 24.4% RoR that cannot be filled. The gate must refuse to build it at all.
+rej = {}
 chain = pd.DataFrame([
     leg(80, 0.95, 1.05),
     leg(75, 0.0, 0.10, last=0.02),
 ])
-res = build_spreads(chain, 100.0, DTE, params())
-check("phantom is constructed but tagged", res.iloc[0]["pricing"], "last")
-check("phantom credit uses the stale print", res.iloc[0]["credit"], 0.98, 1e-9)
-kept = res[res["pricing"] == "mid"]
-check("phantom excluded under the default", len(kept), 0)
+res = build_spreads(chain, 100.0, DTE, params(), rejects=rej)
+check("phantom is never constructed", len(res), 0)
+check("and the reason is logged", bool(rej), True)
+print(f"        reject reasons: {rej}")
 check("zero bid rejected by valid_quote", valid_quote(0.0, 0.10), False)
 check("crossed market rejected", valid_quote(1.20, 1.00), False)
 check("locked market rejected", valid_quote(1.00, 1.00), False)
 check("normal quote accepted", valid_quote(0.95, 1.05), True)
 
-print("\n2b. A stale SHORT leg also taints the spread (regression: the old "
-      "build tagged spreads by the short leg only)")
+print("\n2b. A stale SHORT leg is refused too (the old build tagged spreads "
+      "by the short leg only, so a stale long leg read as fully quoted)")
+rej = {}
 chain = pd.DataFrame([
     leg(80, 0.0, 2.00, last=1.00),     # no bid on the short leg
     leg(75, 0.35, 0.45),
 ])
-res = build_spreads(chain, 100.0, DTE, params())
-check("stale short leg tagged last", res.iloc[0]["pricing"], "last")
+res = build_spreads(chain, 100.0, DTE, params(), rejects=rej)
+check("stale short leg blocks construction", len(res), 0)
+
+print("\n2c. Credit above the width ceiling is rejected (the GS artifact)")
+rej = {}
+chain = pd.DataFrame([leg(80, 3.95, 4.05), leg(75, 0.08, 0.12)])
+# credit 3.90 on a 5 wide = 78% of width; both markets are tight, so the
+# only gate that can fire is the credit ceiling
+res = build_spreads(chain, 100.0, DTE, params(), rejects=rej)
+check("78%-of-width credit rejected", len(res), 0)
+check("logged as a width-ceiling reject",
+      "credit above ceiling vs width" in rej, True)
 
 # -------------------------------------------------------------- risk cap
 
