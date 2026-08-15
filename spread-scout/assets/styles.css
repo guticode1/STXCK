@@ -242,7 +242,9 @@ h1, h2, h3, .display { font-family: var(--display) !important;
   color: var(--amber); background: rgba(224,167,44,.08); }
 
 /* affixes, scoped per widget key [ST] */
-.st-key-max_loss [data-testid="stNumberInputContainer"]::before,
+/* keep in sync with the widget key in app.py — renaming a key silently
+   kills the affix, since the selector just stops matching. [ST] */
+.st-key-risk_cap [data-testid="stNumberInputContainer"]::before,
 .st-key-min_width [data-testid="stNumberInputContainer"]::before {
   content: "$"; align-self: center; padding-left: 10px; margin-right: -4px;
   color: var(--muted); font-family: var(--mono); font-size: 13px;

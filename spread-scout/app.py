@@ -287,11 +287,25 @@ def realized_vol(ticker: str, window: int = 30) -> float | None:
 # (Benzinga partner data is not entitled). These probes are tried in order and
 # fail quietly; when none answer, the UI says earnings data is unavailable
 # rather than implying a candidate is clear of an event.
+#
+# NOT probed on purpose: /vX/reference/tickers/{t}/events. That is the ticker
+# LIFECYCLE feed (ticker_change, name_change, IPO/delisting), not earnings.
+# Reading dates from it would answer "yes, we have earnings data" using events
+# that are not earnings, which flips the honest "earnings unknown" badge into a
+# green "no earnings in window" all-clear — the exact failure this overlay
+# exists to prevent. A ticker change dated inside the window would also render
+# as a report that does not exist.
 EARNINGS_PROBES = (
-    ("/vX/reference/tickers/{t}/events", ("results", "events")),
     ("/v3/reference/earnings", ("results",)),
     ("/benzinga/v1/earnings", ("results",)),
+    ("/benzinga/v1/calendar/earnings", ("results",)),
 )
+
+
+def _is_earnings_item(item: dict) -> bool:
+    """Defense in depth: if a payload labels its rows, only earnings count."""
+    typ = str(item.get("type") or item.get("event_type") or "").lower()
+    return ("earning" in typ) if typ else True
 
 
 @st.cache_data(ttl=86400, show_spinner=False)
@@ -309,6 +323,8 @@ def earnings_dates(ticker: str) -> tuple[list[str], str]:
             continue
         found = []
         for item in (node if isinstance(node, list) else []):
+            if not isinstance(item, dict) or not _is_earnings_item(item):
+                continue
             d = (item.get("date") or item.get("report_date")
                  or item.get("execution_date") or "")
             if isinstance(d, str) and len(d) >= 10:
@@ -425,8 +441,11 @@ def payoff_svg(spot: float, short_k: float, long_k: float, credit: float,
                  f"L{x1:.1f},{Y(max_profit):.1f}")
 
     cone_x, cone_w = X(cone_lo), X(cone_hi) - X(cone_lo)
-    # the 18-22%-below-spot band the short strike is supposed to live in
-    band_hi, band_lo = spot * (1 - otm_lo), spot * (1 - otm_hi)
+    # The 18-22%-below-spot band the short strike is supposed to live in.
+    # Named by PRICE, not by percentage: the larger OTM percentage is the LOWER
+    # strike. Getting these backwards makes the rect's width negative, which
+    # clamps to 1px and renders the band as an invisible hairline.
+    band_lo, band_hi = spot * (1 - otm_hi), spot * (1 - otm_lo)
     strike_in_cone = short_k > cone_lo
 
     def vline(p: float, cls: str) -> str:
@@ -437,8 +456,8 @@ def payoff_svg(spot: float, short_k: float, long_k: float, credit: float,
 <svg class="payoff" viewBox="0 0 {w} {h}" preserveAspectRatio="xMidYMid meet"
      style="width:100%;height:auto;display:block;font-size:{11 if w > 400 else 8.5}px"
      role="img" aria-label="Payoff profile with expected move cone">
-  <rect class="otm-band fade-in" x="{X(band_hi):.1f}" y="{pad_t - 6:.1f}"
-        width="{max(X(band_lo) - X(band_hi), 1):.1f}"
+  <rect class="otm-band fade-in" x="{X(band_lo):.1f}" y="{pad_t - 6:.1f}"
+        width="{max(X(band_hi) - X(band_lo), 1):.1f}"
         height="{h - pad_b - pad_t + 6:.1f}" rx="3"/>
   <rect class="cone fade-in" x="{cone_x:.1f}" y="{pad_t - 6:.1f}"
         width="{max(cone_w, 1):.1f}" height="{h - pad_b - pad_t + 6:.1f}" rx="3"/>
@@ -518,12 +537,22 @@ with st.sidebar:
         # disappearing silently somewhere downstream.
         rejected = [t for t in picked if is_blocked(t)]
         picked = [t for t in picked if not is_blocked(t)]
+        if rejected:
+            # Rewriting session_state alone does not clear the chip: after first
+            # interaction the widget's own key is the source of truth and
+            # `default=` is ignored. set_universe() bumps the nonce so the next
+            # render builds a fresh widget, and the notice is stashed so it
+            # fires exactly once instead of on every later rerun.
+            st.session_state["etf_notice"] = rejected
+            set_universe(picked)
+            st.rerun()
         if picked != universe:
             st.session_state["universe"] = picked
             universe = picked
-        if rejected:
+        notice = st.session_state.pop("etf_notice", None)
+        if notice:
             st.html('<p class="helper" style="color:#FF6B5A;margin:6px 0 0 0">'
-                    f'<b>{esc(", ".join(rejected))}</b> removed — single stocks '
+                    f'<b>{esc(", ".join(notice))}</b> removed — single stocks '
                     'only. Index and leveraged products do not pay for a 20% '
                     'buffer: a diversified index falling 20% is a rarer, far '
                     'more correlated event, and the premium reflects that.</p>')
@@ -1011,16 +1040,23 @@ def metrics_html(df: pd.DataFrame, excluded: int, animate: bool) -> str:
 exclude_last_now = scan.get("params", {}).get("exclude_last", True)
 n_stale = int((results["pricing"] == "last").sum())
 shown = results[results["pricing"] == "mid"] if exclude_last_now else results
-if shown.empty and n_stale:
+stale_fallback = bool(exclude_last_now and n_stale and shown.empty)
+if stale_fallback:
     shown = results          # nothing survives the filter; show the flagged rows
+# When the fallback fires those rows are on screen, so reporting them as
+# excluded would have the strip contradict the table underneath it.
+n_excluded = n_stale if (exclude_last_now and not stale_fallback) else 0
 animate = st.session_state.get("metrics_seen") != scan["at"]
-st.html(metrics_html(shown, n_stale if exclude_last_now else 0, animate),
+st.html(metrics_html(shown, n_excluded, animate),
         unsafe_allow_javascript=animate)
 st.session_state["metrics_seen"] = scan["at"]
 st.html(f'<p class="payoff-note" style="margin:6px 0 18px 2px">scan completed '
         f'{esc(scan["at"])} · {len(shown):,} candidates shown'
-        + (f' · {n_stale:,} excluded for stale last-trade pricing'
-           if (exclude_last_now and n_stale) else '')
+        + (f' · {n_excluded:,} excluded for stale last-trade pricing'
+           if n_excluded else '')
+        + (' · every candidate is stale-priced, so the pricing filter is '
+           'showing them rather than an empty table — treat each as unfillable '
+           'until you check a live quote' if stale_fallback else '')
         + ' · sleeves are ranked separately</p>')
 
 # ---------------------------------------------------------------- results
@@ -1141,7 +1177,8 @@ def exposure_tray(sel: pd.DataFrame) -> str:
         f'gap:4px;max-width:340px">{bars}</div></div>')
 
 
-def render_results(df: pd.DataFrame, slot: str, cross: bool) -> None:
+def render_results(df: pd.DataFrame, slot: str, cross: bool,
+                   scan_otm: tuple[int, int]) -> None:
     """One regime sleeve (or the cross-regime comparison).
 
     Ranking is the strategy's, not the table's: raw return on risk inside a
@@ -1215,14 +1252,16 @@ def render_results(df: pd.DataFrame, slot: str, cross: bool) -> None:
             st.html('<p class="section-title" style="margin-top:18px">'
                     'Selected exposure</p>')
             st.html(exposure_tray(sel))
-        row_detail(sel.iloc[0], slot)
+        row_detail(sel.iloc[0], slot, scan_otm)
 
     st.download_button("Download CSV", ranked.to_csv(index=False),
                        f"spread_scout_{slot}_{today}.csv", "text/csv",
                        key=f"dl_{slot}", icon=":material/download:")
 
 
-def row_detail(r: pd.Series, slot: str) -> None:
+def row_detail(r: pd.Series, slot: str, scan_otm: tuple[int, int]) -> None:
+    """`scan_otm` is the band the scan ran with. Reading the live slider here
+    would redraw the band under a strike that was chosen at a different one."""
     iv = float(r["short_iv"]) if pd.notna(r.get("short_iv")) else 0.35
     spot = float(r["spot"]) if pd.notna(r.get("spot")) else \
         float(r["short_k"]) / (1 - r["pct_otm"] / 100)
@@ -1237,7 +1276,7 @@ def row_detail(r: pd.Series, slot: str) -> None:
             payoff_svg(spot, float(r["short_k"]), float(r["long_k"]),
                        float(r["credit"]), int(r["dte"]), iv,
                        live=pd.notna(r.get("short_iv")), w=600, h=232,
-                       otm_lo=otm_band[0] / 100, otm_hi=otm_band[1] / 100)))
+                       otm_lo=scan_otm[0] / 100, otm_hi=scan_otm[1] / 100)))
     with right:
         badge = ('<span class="badge badge-last">last-trade priced</span>'
                  if r["pricing"] == "last"
@@ -1287,6 +1326,7 @@ def _q(v) -> str:
 # The two sleeves are separate products with different risks, so they get
 # separate tables. The cross-regime tab is the only place they are compared,
 # and only on annualized return.
+scan_otm = tuple(sparams.get("otm", tuple(otm_band)))
 present = [w for w in (WIN_SHORT, WIN_LONG) if w in set(shown["window"])]
 labels = list(present)
 if len(present) > 1:
@@ -1308,7 +1348,8 @@ for i, w in enumerate(present):
     with tabs[i]:
         st.html(f'<p class="section-title">{esc(w)}</p>'
                 f'<p class="sub" style="margin-bottom:12px">{REGIME_NOTE[w]}</p>')
-        render_results(shown[shown["window"] == w], slot=w[:6], cross=False)
+        render_results(shown[shown["window"] == w], slot=w[:6], cross=False,
+                       scan_otm=scan_otm)
 
 if len(present) > 1:
     with tabs[len(present)]:
@@ -1317,7 +1358,7 @@ if len(present) > 1:
                 'annualized axis. Simple annualization assumes you redeploy at '
                 'the same terms all year, which the short sleeve has to earn '
                 'twelve times over and the far-dated sleeve does not.</p>')
-        render_results(shown, slot="cross", cross=True)
+        render_results(shown, slot="cross", cross=True, scan_otm=scan_otm)
 
 tab_news = tabs[-1]
 
@@ -1327,7 +1368,10 @@ CHIP_CLASS = {"positive": "badge-mid", "negative": "badge-last",
               "neutral": "badge-win"}
 
 with tab_news:
-    top_names = list(shown["ticker"].drop_duplicates().head(8))
+    # run_scan no longer returns a globally sorted frame (ranking moved into
+    # the per-sleeve tables), so rank here explicitly rather than inheriting an
+    # order that no longer exists — otherwise this is just universe order.
+    top_names = list(rank_cross_regime(shown)["ticker"].drop_duplicates().head(8))
     st.html('<p class="section-title">Coverage on the top names</p>'
             f'<p class="sub" style="margin-bottom:10px">Recent articles and '
             f'sentiment for the {len(top_names)} highest-ranked underlyings.</p>')
