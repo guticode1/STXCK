@@ -485,6 +485,9 @@ svg.payoff .zero { stroke: #2C3548; stroke-dasharray: 3 3; }
 svg.payoff .kmark { stroke: var(--muted); stroke-dasharray: 2 3; opacity: .75; }
 svg.payoff .cone { fill: rgba(110,168,255,.10); stroke: rgba(110,168,255,.35);
   stroke-dasharray: 3 3; }
+/* the strike band the strategy targets, shaded against spot */
+svg.payoff .otm-band { fill: rgba(224,167,44,.09); stroke: rgba(224,167,44,.30);
+  stroke-dasharray: 2 3; }
 svg.payoff .spot { stroke: var(--text); opacity: .55; }
 /* size comes from the svg element (set per context in payoff_svg) so labels
    stay legible whether the diagram is 292px or 600px wide */

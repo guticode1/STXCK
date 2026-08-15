@@ -15,9 +15,18 @@ Secrets required (see .streamlit/secrets.toml.example):
   APP_PASSWORD      shared password for private access
   ANTHROPIC_API_KEY optional, enables AI news briefs
 
-Presentation lives in assets/styles.css. The data layer and screener below
-are load-bearing: pricing labels (mid/last) and liquidity filters must not be
-removed. This is a screening tool, not investment advice.
+Layout of the code:
+  strategy.py          pure strategy layer — formulas, filters, ranking.
+                       No Streamlit, no network. Unit tested in tests/.
+  app.py (this file)   data fetching, caching, and the interface.
+  assets/styles.css    all presentation.
+
+Load-bearing rules that must not be quietly removed: spreads are priced from
+bid/ask midpoints and rows that fell back to a stale last trade are tagged and
+excluded by default; open interest is required on both legs before a spread is
+constructed; the two DTE regimes are ranked separately.
+
+This is a screening tool, not investment advice.
 """
 
 from __future__ import annotations
@@ -25,13 +34,18 @@ from __future__ import annotations
 import datetime as dt
 import math
 import time
-from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import quote
 
 import pandas as pd
 import requests
 import streamlit as st
+
+from strategy import (
+    BLOCK_REASON, ETF_BLOCKLIST, Params, build_spreads, earnings_in_window,
+    is_blocked, rank_cross_regime, rank_within_regime, rv_from_closes,
+    valid_quote,
+)
 
 API_BASE = "https://api.massive.com"  # Polygon-compatible; api.polygon.io also works
 CSS_PATH = Path(__file__).parent / "assets" / "styles.css"
@@ -202,7 +216,12 @@ def spot_prices(tickers: tuple[str, ...]) -> dict[str, float]:
 @st.cache_data(ttl=600, show_spinner=False)
 def put_chain(ticker: str, exp_gte: str, exp_lte: str,
               k_lo: float, k_hi: float) -> pd.DataFrame:
-    """All puts for one underlying inside an expiry window and strike band."""
+    """All puts for one underlying inside an expiry window and strike band.
+
+    Emits both a strict midpoint price (`mid`, NaN when there is no usable
+    two-sided market) and a permissive one (`px_fallback`). The screener always
+    tags which was used; the UI excludes last-trade rows by default.
+    """
     rows, url_params = [], {
         "contract_type": "put",
         "expiration_date.gte": exp_gte, "expiration_date.lte": exp_lte,
@@ -214,16 +233,20 @@ def put_chain(ticker: str, exp_gte: str, exp_lte: str,
             det, day = c.get("details", {}), c.get("day", {})
             quote_, greeks = c.get("last_quote", {}) or {}, c.get("greeks", {}) or {}
             bid, ask = quote_.get("bid"), quote_.get("ask")
-            mid = (bid + ask) / 2 if bid and ask else None
+            ok = valid_quote(bid, ask)
+            mid = (bid + ask) / 2 if ok else None
             rows.append({
                 "ticker": ticker,
                 "exp": det.get("expiration_date"),
                 "strike": det.get("strike_price"),
-                "mid": mid,                       # preferred price
-                "last": day.get("close"),         # fallback price
+                "mid": mid,                       # midpoint, only when tradable
+                "last": day.get("close"),         # stale print, never preferred
                 "bid": bid, "ask": ask,
+                # market width as a fraction of mid; None when there is no market
+                "ba_pct": ((ask - bid) / mid) if ok and mid > 0 else None,
                 "delta": greeks.get("delta"),
                 "iv": c.get("implied_volatility"),
+                "vega": greeks.get("vega"),
                 "oi": c.get("open_interest") or 0,
                 "vol": day.get("volume") or 0,
             })
@@ -235,9 +258,64 @@ def put_chain(ticker: str, exp_gte: str, exp_lte: str,
     df = pd.DataFrame(rows)
     if df.empty:
         return df
-    df["px"] = df["mid"].fillna(df["last"])
     df["px_src"] = df["mid"].notna().map({True: "mid", False: "last"})
-    return df.dropna(subset=["px", "strike", "exp"])
+    df["px_fallback"] = df["mid"].fillna(df["last"])
+    return df.dropna(subset=["px_fallback", "strike", "exp"])
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def realized_vol(ticker: str, window: int = 30) -> float | None:
+    """Annualized close-to-close realized volatility from daily bars.
+
+    Uses the aggregates endpoint on the same key — no new data source. This is
+    the denominator for IV/RV: it answers whether a fat premium is fat because
+    the market is scared, or because the stock actually moves.
+    """
+    end = dt.date.today()
+    start = end - dt.timedelta(days=window * 2 + 20)
+    try:
+        data = _get(f"/v2/aggs/ticker/{ticker}/range/1/day/"
+                    f"{start.isoformat()}/{end.isoformat()}",
+                    {"adjusted": "true", "sort": "asc", "limit": 400})
+    except requests.RequestException:
+        return None
+    closes = [r.get("c") for r in (data.get("results") or []) if r.get("c")]
+    return rv_from_closes(closes, window)
+
+
+# Earnings: the Massive plan of record does not include a calendar feed
+# (Benzinga partner data is not entitled). These probes are tried in order and
+# fail quietly; when none answer, the UI says earnings data is unavailable
+# rather than implying a candidate is clear of an event.
+EARNINGS_PROBES = (
+    ("/vX/reference/tickers/{t}/events", ("results", "events")),
+    ("/v3/reference/earnings", ("results",)),
+    ("/benzinga/v1/earnings", ("results",)),
+)
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def earnings_dates(ticker: str) -> tuple[list[str], str]:
+    """(ISO dates, source label). Empty list + "" when no feed is entitled."""
+    for path, keys in EARNINGS_PROBES:
+        try:
+            data = _get(path.format(t=ticker), {"ticker": ticker, "limit": 12})
+        except Exception:
+            continue
+        node = data
+        for k in keys:
+            node = (node or {}).get(k) if isinstance(node, dict) else node
+        if not node:
+            continue
+        found = []
+        for item in (node if isinstance(node, list) else []):
+            d = (item.get("date") or item.get("report_date")
+                 or item.get("execution_date") or "")
+            if isinstance(d, str) and len(d) >= 10:
+                found.append(d[:10])
+        if found:
+            return sorted(set(found)), path
+    return [], ""
 
 
 @st.cache_data(ttl=900, show_spinner=False)
@@ -301,75 +379,16 @@ def claude_brief(ticker: str, articles: list[dict]) -> str | None:
     except Exception:
         return None
 
+
 # ---------------------------------------------------------------- screener
 
-
-@dataclass
-class Params:
-    otm_lo: float
-    otm_hi: float
-    max_loss: float
-    min_ror: float
-    min_oi_short: int
-    min_oi_long: int
-    max_spread_pct: float
-    min_width: float
-
-
-def build_spreads(chain: pd.DataFrame, spot: float, dte_of: dict[str, int],
-                  p: Params) -> pd.DataFrame:
-    if chain.empty:
-        return pd.DataFrame()
-    shorts = chain[(chain["strike"] >= (1 - p.otm_hi) * spot)
-                   & (chain["strike"] <= (1 - p.otm_lo) * spot)
-                   & (chain["oi"] >= p.min_oi_short)]
-    out = []
-    for _, s in shorts.iterrows():
-        # penalize wide markets on the short leg when quotes exist
-        if s["bid"] and s["ask"] and s["mid"]:
-            if s["mid"] > 0 and (s["ask"] - s["bid"]) / s["mid"] > p.max_spread_pct:
-                continue
-        longs = chain[(chain["exp"] == s["exp"])
-                      & (chain["strike"] < s["strike"] - p.min_width + 1e-9)
-                      & (chain["oi"] >= p.min_oi_long)]
-        for _, l in longs.iterrows():
-            width = s["strike"] - l["strike"]
-            credit = s["px"] - l["px"]
-            if credit <= 0.05:
-                continue
-            max_loss = (width - credit) * 100
-            if max_loss <= 0 or max_loss > p.max_loss:
-                continue
-            ror = 100 * credit / (width - credit)
-            if ror < p.min_ror:
-                continue
-            dte = dte_of.get(s["exp"], 0) or 1
-            out.append({
-                "ticker": s["ticker"], "exp": s["exp"], "dte": dte,
-                "short_k": s["strike"], "long_k": l["strike"],
-                "pct_otm": round(100 * (1 - s["strike"] / spot), 1),
-                "width": round(width, 1), "credit": round(credit, 2),
-                "max_loss": round(max_loss, 0),
-                "ror_pct": round(ror, 1),
-                "annualized_pct": round(ror * 365 / dte, 1),
-                "short_delta": round(s["delta"], 3) if s["delta"] else None,
-                "short_iv": round(s["iv"], 2) if s["iv"] else None,
-                "short_oi": int(s["oi"]), "long_oi": int(l["oi"]),
-                "pricing": s["px_src"],
-            })
-    df = pd.DataFrame(out)
-    if df.empty:
-        return df
-    # keep the best spread per (ticker, exp, short strike) to reduce noise
-    return (df.sort_values("ror_pct", ascending=False)
-              .groupby(["ticker", "exp", "short_k"], as_index=False).head(2)
-              .sort_values("ror_pct", ascending=False).reset_index(drop=True))
 
 # ------------------------------------------------------- signature element
 
 
 def payoff_svg(spot: float, short_k: float, long_k: float, credit: float,
-               dte: int, iv: float, live: bool, w: int = 328, h: int = 156) -> str:
+               dte: int, iv: float, live: bool, w: int = 328, h: int = 156,
+               otm_lo: float = 0.18, otm_hi: float = 0.22) -> str:
     """Payoff profile with a ±1σ expected-move cone overlaid.
 
     The cone is the point: a payoff diagram alone can't tell you whether 20%
@@ -406,6 +425,8 @@ def payoff_svg(spot: float, short_k: float, long_k: float, credit: float,
                  f"L{x1:.1f},{Y(max_profit):.1f}")
 
     cone_x, cone_w = X(cone_lo), X(cone_hi) - X(cone_lo)
+    # the 18-22%-below-spot band the short strike is supposed to live in
+    band_hi, band_lo = spot * (1 - otm_lo), spot * (1 - otm_hi)
     strike_in_cone = short_k > cone_lo
 
     def vline(p: float, cls: str) -> str:
@@ -416,6 +437,9 @@ def payoff_svg(spot: float, short_k: float, long_k: float, credit: float,
 <svg class="payoff" viewBox="0 0 {w} {h}" preserveAspectRatio="xMidYMid meet"
      style="width:100%;height:auto;display:block;font-size:{11 if w > 400 else 8.5}px"
      role="img" aria-label="Payoff profile with expected move cone">
+  <rect class="otm-band fade-in" x="{X(band_hi):.1f}" y="{pad_t - 6:.1f}"
+        width="{max(X(band_lo) - X(band_hi), 1):.1f}"
+        height="{h - pad_b - pad_t + 6:.1f}" rx="3"/>
   <rect class="cone fade-in" x="{cone_x:.1f}" y="{pad_t - 6:.1f}"
         width="{max(cone_w, 1):.1f}" height="{h - pad_b - pad_t + 6:.1f}" rx="3"/>
   <line class="zero" x1="{x0:.1f}" y1="{y_zero:.1f}" x2="{x1:.1f}"
@@ -437,6 +461,8 @@ def payoff_svg(spot: float, short_k: float, long_k: float, credit: float,
         fill="#E8EBF2">spot {spot:,.2f}</text>
   <text x="{cone_x + max(cone_w, 1) / 2:.1f}" y="{h - 7:.1f}" text-anchor="middle"
         fill="{'#FF6B5A' if strike_in_cone else '#6EA8FF'}">±1σ</text>
+  <text x="{(X(band_hi) + X(band_lo)) / 2:.1f}" y="{pad_t - 12:.1f}"
+        text-anchor="middle" fill="#E0A72C">{otm_lo * 100:.0f}–{otm_hi * 100:.0f}% OTM</text>
 </svg>
 <div class="payoff-note" style="display:flex;justify-content:space-between;
      padding:2px 8px 2px 8px">
@@ -488,9 +514,19 @@ with st.sidebar:
             help="Removable chips. Anything you type is accepted, so tickers "
                  "outside the presets still work.")
         picked = [t.strip().upper() for t in picked if t.strip()]
+        # ETFs are rejected at the point of entry, with the reason, rather than
+        # disappearing silently somewhere downstream.
+        rejected = [t for t in picked if is_blocked(t)]
+        picked = [t for t in picked if not is_blocked(t)]
         if picked != universe:
             st.session_state["universe"] = picked
             universe = picked
+        if rejected:
+            st.html('<p class="helper" style="color:#FF6B5A;margin:6px 0 0 0">'
+                    f'<b>{esc(", ".join(rejected))}</b> removed — single stocks '
+                    'only. Index and leveraged products do not pay for a 20% '
+                    'buffer: a diversified index falling 20% is a rarer, far '
+                    'more correlated event, and the premium reflects that.</p>')
 
         # preset baskets — additive/subtractive, active when fully contained
         cols = st.columns(2)
@@ -561,15 +597,18 @@ with st.sidebar:
 
     # ---- strategy
     otm_state = st.session_state.get("otm_band", (18, 22))
-    ml_state = st.session_state.get("max_loss", 2200)
+    ml_state = st.session_state.get("risk_cap", 2200)
     with st.expander(f"◆  Strategy · {otm_state[0]}–{otm_state[1]}% OTM · "
-                     f"max ${ml_state:,}", expanded=True):
+                     f"risk ${ml_state:,}", expanded=True):
         st.html('<p class="helper">Where the short strike sits, and how much '
-                'collateral each spread may risk.</p>')
+                'collateral a position may risk.</p>')
         otm_band = st.slider("Short strike, % below spot", 10, 35, (18, 22),
                              key="otm_band")
-        max_loss = st.number_input("Max loss per spread", 100, 25000, 2200, 100,
-                                   key="max_loss")
+        risk_cap = st.number_input(
+            "Risk cap per position", 100, 25000, 2200, 100, key="risk_cap",
+            help="Two jobs: a spread whose single contract risks more than this "
+                 "is rejected outright, and everything that survives is sized "
+                 "to contracts = floor(cap / max loss per contract).")
         min_ror = st.slider("Min return on risk (%)", 0, 40, 5, key="min_ror")
         min_width = st.number_input("Min spread width", 1.0, 50.0, 2.5, 0.5,
                                     key="min_width")
@@ -590,7 +629,8 @@ with st.sidebar:
             "Payoff preview", f"{prev_dte}d · spot 100",
             payoff_svg(prev_spot, round(prev_short, 1), round(prev_long, 1),
                        round(prev_credit, 2), prev_dte, 0.35, live=False,
-                       w=292, h=150)))
+                       w=292, h=150, otm_lo=otm_band[0] / 100,
+                       otm_hi=otm_band[1] / 100)))
         st.html('<p class="helper" style="margin-top:8px">Drawn at your minimum '
                 'return on risk — the least you would accept, on a $100 stock.</p>')
 
@@ -601,15 +641,21 @@ with st.sidebar:
     with st.expander(f"≋  Liquidity · OI {oi_s_state}/{oi_l_state} · "
                      f"≤{ba_state}% width", expanded=False):
         st.html('<p class="helper">Open-interest floors per leg, and how wide a '
-                'bid/ask the short leg may quote.</p>')
+                'bid/ask either leg may quote.</p>')
         min_oi_s = st.number_input("Min OI, short leg", 0, 50000, 300, 50,
                                    key="min_oi_s")
         min_oi_l = st.number_input("Min OI, long leg", 0, 50000, 100, 50,
                                    key="min_oi_l")
         max_ba = st.slider("Max bid/ask width (% of mid)", 5, 100, 40, key="max_ba")
+        exclude_last = st.toggle(
+            "Exclude last-trade pricing", value=True, key="exclude_last",
+            help="On by default. A far-OTM strike with no bid still carries a "
+                 "stale last print; pricing off it manufactures spreads that "
+                 "look excellent and cannot be filled. Turn this off to see "
+                 "them — they stay flagged and rank below quoted spreads.")
 
         strict = (min(min_oi_s / 1500, 1) + min(min_oi_l / 800, 1)
-                  + min((100 - max_ba) / 80, 1)) / 3
+                  + min((100 - max_ba) / 80, 1) + (1 if exclude_last else 0)) / 4
         lit = max(1, round(strict * 5))
         st.html('<div class="meter"><span>loose</span><span class="meter-track">'
                 + "".join(f'<i class="meter-seg{" on" if i < lit else ""}"></i>'
@@ -638,7 +684,7 @@ with st.sidebar:
                 f'{max(2, round(n_chains * 1.1 / 60)):d} min</div>')
 
 params = Params(otm_lo=otm_band[0] / 100, otm_hi=otm_band[1] / 100,
-                max_loss=max_loss, min_ror=min_ror,
+                risk_cap=risk_cap, min_ror=min_ror,
                 min_oi_short=min_oi_s, min_oi_long=min_oi_l,
                 max_spread_pct=max_ba / 100, min_width=min_width)
 
@@ -669,7 +715,7 @@ st.html(
     '<span class="topbar-chips">'
     f'<span class="chip">names <b>{len(universe)}</b></span>'
     f'<span class="chip">OTM <b>{otm_band[0]}–{otm_band[1]}%</b></span>'
-    f'<span class="chip">max loss <b>${max_loss:,}</b></span>'
+    f'<span class="chip">risk cap <b>${risk_cap:,}</b></span>'
     f'<span class="chip">min RoR <b>{min_ror}%</b></span>'
     f'<span class="chip{"" if use_short else " is-off"}">{WIN_SHORT}</span>'
     f'<span class="chip{"" if use_long else " is-off"}">{WIN_LONG}</span>'
@@ -736,7 +782,7 @@ def run_scan() -> dict:
         bar.progress(i / len(work), text=f"Fetching {t} chains · {label} "
                                          f"· {i + 1} of {len(work)}")
         spot = spots[t]
-        k_lo = (1 - params.otm_hi) * spot - max_loss / 100 - 5   # room for long legs
+        k_lo = (1 - params.otm_hi) * spot - risk_cap / 100 - 5   # room for long legs
         k_hi = (1 - params.otm_lo) * spot + 1
         try:
             chain = put_chain(t, d0.isoformat(), d1.isoformat(), k_lo, k_hi)
@@ -760,16 +806,40 @@ def run_scan() -> dict:
             tape.append((t, 0, "none", label))
         tape_slot.html(tape_html(tape))
 
-    bar.progress(1.0, text="Ranking candidates…")
-    df = (pd.concat(all_rows, ignore_index=True)
-          .sort_values("ror_pct", ascending=False).reset_index(drop=True)
-          if all_rows else pd.DataFrame())
+    df = pd.concat(all_rows, ignore_index=True) if all_rows else pd.DataFrame()
+
+    # ---- volatility and event context, one call per surviving underlying
+    earn_source = ""
+    if not df.empty:
+        names = sorted(df["ticker"].unique())
+        bar.progress(1.0, text=f"Volatility and events · {len(names)} names")
+        rv_map, earn_map = {}, {}
+        for t in names:
+            rv_map[t] = realized_vol(t)
+            dates, src = earnings_dates(t)
+            earn_map[t] = dates
+            earn_source = earn_source or src
+        df["rv30"] = df["ticker"].map(lambda t: rv_map.get(t))
+        df["iv_rv"] = [
+            round(iv / rv, 2) if (iv and rv and rv > 0) else None
+            for iv, rv in zip(df["short_iv"], df["rv30"])]
+        df["rv30"] = df["rv30"].map(lambda v: round(v, 3) if v else None)
+        df["earnings_in_window"] = [
+            earnings_in_window(earn_map.get(t, []), today,
+                               dt.date.fromisoformat(e))
+            for t, e in zip(df["ticker"], df["exp"])]
+        df["earnings_known"] = bool(earn_source)
+        if not earn_source:
+            notes.append("No earnings calendar is entitled on this data plan — "
+                         "event risk is unverified, not absent.")
+
     bar.empty(); tape_slot.empty(); skel_slot.empty()
-    return {"results": df, "notes": notes,
+    return {"results": df, "notes": notes, "earn_source": earn_source,
             "at": dt.datetime.now().strftime("%b %d · %H:%M"),
             "params": {"min_ror": min_ror, "otm": tuple(otm_band),
-                       "max_loss": max_loss, "min_oi_s": min_oi_s,
-                       "max_ba": max_ba, "min_width": min_width}}
+                       "risk_cap": risk_cap, "min_oi_s": min_oi_s,
+                       "max_ba": max_ba, "min_width": min_width,
+                       "exclude_last": exclude_last}}
 
 
 if run:
@@ -833,12 +903,19 @@ if results.empty:
 # ---------------------------------------------------------------- metrics
 
 
-def metrics_html(df: pd.DataFrame, animate: bool) -> str:
+def metrics_html(df: pd.DataFrame, excluded: int, animate: bool) -> str:
+    """Strip above the table. `df` is what survives the pricing filter;
+    `excluded` is how many candidates were dropped for stale pricing."""
     med, best = df["ror_pct"].median(), df["ror_pct"].max()
-    avg_dte, last_pct = df["dte"].mean(), (df["pricing"] == "last").mean() * 100
-    tiles = [("candidates", len(df), 0, "", ""), ("median RoR", med, 1, "", "%"),
-             ("best RoR", best, 1, "", "%"), ("avg DTE", avg_dte, 0, "", "d"),
-             ("priced off last", last_pct, 0, "", "%")]
+    best_ann = df["annualized_pct"].max()
+    with_earn = int((df["earnings_in_window"] > 0).sum()) \
+        if "earnings_in_window" in df.columns else 0
+    tiles = [("candidates", len(df), 0, "", ""),
+             ("median RoR", med, 1, "", "%"),
+             ("best RoR", best, 1, "", "%"),
+             ("best annualized", best_ann, 0, "", "%"),
+             ("earnings in window", with_earn, 0, "", ""),
+             ("excluded · stale price", excluded, 0, "", "")]
     cards = ""
     for label, val, dec, pre, suf in tiles:
         shown = f"{pre}{val:,.{dec}f}{suf}"
@@ -899,12 +976,22 @@ def metrics_html(df: pd.DataFrame, animate: bool) -> str:
     return f'<div class="metric-strip">{cards}{spark}</div>{js}'
 
 
+# Stale-priced rows are excluded by default; the count is reported, never
+# silently dropped.
+exclude_last_now = scan.get("params", {}).get("exclude_last", True)
+n_stale = int((results["pricing"] == "last").sum())
+shown = results[results["pricing"] == "mid"] if exclude_last_now else results
+if shown.empty and n_stale:
+    shown = results          # nothing survives the filter; show the flagged rows
 animate = st.session_state.get("metrics_seen") != scan["at"]
-st.html(metrics_html(results, animate), unsafe_allow_javascript=animate)
+st.html(metrics_html(shown, n_stale if exclude_last_now else 0, animate),
+        unsafe_allow_javascript=animate)
 st.session_state["metrics_seen"] = scan["at"]
 st.html(f'<p class="payoff-note" style="margin:6px 0 18px 2px">scan completed '
-        f'{esc(scan["at"])} · {len(results):,} candidates ranked by return on '
-        f'risk</p>')
+        f'{esc(scan["at"])} · {len(shown):,} candidates shown'
+        + (f' · {n_stale:,} excluded for stale last-trade pricing'
+           if (exclude_last_now and n_stale) else '')
+        + ' · sleeves are ranked separately</p>')
 
 # ---------------------------------------------------------------- results
 
@@ -916,37 +1003,147 @@ def dot_uri(color: str) -> str:
 
 
 def order_ticket(row: pd.Series) -> str:
-    return (f"SELL -1 {row['ticker']} {row['exp']} {row['short_k']:g}P / "
-            f"BUY +1 {row['long_k']:g}P  @ {row['credit']:.2f} CR   "
-            f"[width {row['width']:g} · max loss ${row['max_loss']:,.0f} · "
-            f"{int(row['dte'])}d]")
+    n = int(row.get("contracts") or 1)
+    return (f"SELL -{n} {row['ticker']} {row['exp']} {row['short_k']:g}P / "
+            f"BUY +{n} {row['long_k']:g}P  @ {row['credit']:.2f} CR   "
+            f"[{n} × ${row['max_loss']:,.0f} risk = ${row['total_risk']:,.0f} · "
+            f"credit ${row['total_credit']:,.0f} · {int(row['dte'])}d]")
 
 
-QUICK = {"RoR > 10%": lambda d: d["ror_pct"] > 10,
-         "30–45 DTE only": lambda d: d["window"] == WIN_SHORT,
-         "Exclude last-trade": lambda d: d["pricing"] == "mid",
-         "Width ≥ $5": lambda d: d["width"] >= 5}
+QUICK = {
+    "RoR > 10%": lambda d: d["ror_pct"] > 10,
+    "No earnings in window": lambda d: d.get("earnings_in_window",
+                                             pd.Series(0, index=d.index)) == 0,
+    "Tight markets only": lambda d: (d["short_ba_pct"].fillna(999) <= 20)
+                                    & (d["long_ba_pct"].fillna(999) <= 20),
+    "Width \u2265 $5": lambda d: d["width"] >= 5,
+    "Exclude last-trade": lambda d: d["pricing"] == "mid",
+}
+
+TABLE_COLS = ["sector", "ticker", "spot", "exp", "dte", "legs", "pct_otm",
+              "width", "credit", "max_loss", "contracts", "total_credit",
+              "ror_pct", "annualized_pct", "earn", "iv_rv", "short_iv", "rv30",
+              "ba_worst", "short_oi", "long_oi", "priced"]
 
 
-@st.fragment
-def results_panel(df: pd.DataFrame) -> None:
-    """Filters + table + detail live in a fragment so filtering re-renders only
-    this block instead of the whole page."""
-    st.html('<p class="section-title">Candidates</p>')
+def table_config(disp: pd.DataFrame, cross: bool) -> dict:
+    return {
+        "sector": st.column_config.ImageColumn("", width=36, help="Sector"),
+        "ticker": st.column_config.TextColumn("Ticker", width="small"),
+        "spot": st.column_config.NumberColumn("Spot", format="$%.2f"),
+        "exp": st.column_config.TextColumn("Expiry", width="small"),
+        "dte": st.column_config.NumberColumn("DTE", format="%d", width="small"),
+        "legs": st.column_config.TextColumn("Short / long",
+                                            help="Short strike / long strike"),
+        "pct_otm": st.column_config.NumberColumn("% OTM", format="%.1f%%"),
+        "width": st.column_config.NumberColumn("Width", format="$%.2f"),
+        "credit": st.column_config.NumberColumn("Credit", format="$%.2f"),
+        "max_loss": st.column_config.NumberColumn(
+            "Max loss", format="$%.2f",
+            help="Per contract — the collateral at risk. Qty × this = total risk."),
+        "contracts": st.column_config.NumberColumn(
+            "Qty", format="%d", help="floor(risk cap / max loss per contract)"),
+        "total_credit": st.column_config.NumberColumn(
+            "Total credit", format="$%d", help="Credit collected at that size"),
+        "ror_pct": st.column_config.ProgressColumn(
+            "Return on risk", format="%.1f%%", min_value=0.0,
+            max_value=float(max(disp["ror_pct"].max(), 1))),
+        "annualized_pct": (
+            st.column_config.ProgressColumn(
+                "Annualized", format="%.0f%%", min_value=0.0,
+                max_value=float(max(disp["annualized_pct"].max(), 1)))
+            if cross else
+            st.column_config.NumberColumn("Annualized", format="%.0f%%")),
+        "earn": st.column_config.TextColumn(
+            "Earnings", width="small",
+            help="Reports scheduled between today and expiration"),
+        "iv_rv": st.column_config.NumberColumn(
+            "IV/RV", format="%.2f",
+            help="Implied vs realized vol. Near 1.0 means the premium is "
+                 "priced for how much this name actually moves."),
+        "short_iv": st.column_config.NumberColumn("IV", format="%.2f"),
+        "rv30": st.column_config.NumberColumn("RV30", format="%.2f",
+                                              help="30-day realized volatility"),
+        "ba_worst": st.column_config.NumberColumn(
+            "B/A width", format="%.0f%%",
+            help="Widest of the two legs, as a share of mid"),
+        "short_oi": st.column_config.NumberColumn("OI short", format="%d"),
+        "long_oi": st.column_config.NumberColumn("OI long", format="%d"),
+        "priced": st.column_config.TextColumn(
+            "Priced", width="small",
+            help="mid = bid/ask midpoint · LAST = stale last trade"),
+    }
+
+
+def exposure_tray(sel: pd.DataFrame) -> str:
+    """Correlated-loss profile of a basket, made visible.
+
+    Losses in this strategy arrive in crashes: clustered, and correlated across
+    positions. Concentration is the thing that turns a bad month into a bad
+    year, so it is shown next to the total.
+    """
+    total_risk = float(sel["total_risk"].sum())
+    total_credit = float(sel["total_credit"].sum())
+    by_sec: dict[str, float] = {}
+    for t, risk in zip(sel["ticker"], sel["total_risk"]):
+        k = SECTOR_META[sector_of(t)][0]
+        by_sec[k] = by_sec.get(k, 0) + float(risk)
+    top = max(by_sec.items(), key=lambda kv: kv[1]) if by_sec else ("—", 0)
+    conc = 100 * top[1] / total_risk if total_risk else 0
+    bars = "".join(
+        f'<span style="display:flex;justify-content:space-between;gap:12px">'
+        f'<span>{esc(k)}</span><span class="mono" style="color:#E8EBF2">'
+        f'${v:,.0f}</span></span>'
+        for k, v in sorted(by_sec.items(), key=lambda kv: -kv[1]))
+    warn = ('<span class="badge badge-last" style="margin-left:8px">'
+            'concentrated</span>' if conc >= 60 and len(sel) > 1 else "")
+    return (
+        '<div class="panel" style="margin-top:14px"><div class="kv">'
+        f'<div class="kv-item"><div class="kv-k">spreads selected</div>'
+        f'<div class="kv-v">{len(sel)}</div></div>'
+        f'<div class="kv-item"><div class="kv-k">total risk</div>'
+        f'<div class="kv-v risk">${total_risk:,.0f}</div></div>'
+        f'<div class="kv-item"><div class="kv-k">total credit</div>'
+        f'<div class="kv-v credit">${total_credit:,.0f}</div></div>'
+        f'<div class="kv-item"><div class="kv-k">largest sector</div>'
+        f'<div class="kv-v">{conc:.0f}%{warn}</div></div>'
+        f'</div><div class="payoff-note" style="margin-top:12px;display:grid;'
+        f'gap:4px;max-width:340px">{bars}</div></div>')
+
+
+def render_results(df: pd.DataFrame, slot: str, cross: bool) -> None:
+    """One regime sleeve (or the cross-regime comparison).
+
+    Ranking is the strategy's, not the table's: raw return on risk inside a
+    regime, simple annualized across them. Sorting one mixed list by raw RoR
+    would bury every 30-45 DTE candidate, because far-dated spreads collect a
+    bigger credit for the same 20% buffer.
+    """
+    if df.empty:
+        st.html('<div class="panel"><p class="sub">Nothing in this sleeve.</p></div>')
+        return
+    ranked = rank_cross_regime(df) if cross else rank_within_regime(df)
+
+    st.html(
+        '<p class="payoff-note" style="margin:2px 0 10px 2px">'
+        + ('Ranked by <b>simple annualized</b> return on risk — RoR × 365 ÷ DTE, '
+           'not compounded. This is the only fair way to line the two sleeves '
+           'up against each other.'
+           if cross else
+           'Ranked by <b>return on risk</b> within this sleeve. '
+           'Compare across sleeves on the annualized tab.') + '</p>')
+
     picks = st.pills("Quick filters", list(QUICK), selection_mode="multi",
-                     key="quick_filters", label_visibility="collapsed")
-    f1, f2 = st.columns([1, 2])
-    win_pick = f1.selectbox("Window", ["All windows"] + sorted(df["window"].unique()),
-                            key="win_pick", label_visibility="collapsed")
-    tick_pick = f2.multiselect("Tickers", sorted(df["ticker"].unique()),
-                               key="tick_pick", placeholder="All tickers",
+                     key=f"qf_{slot}", label_visibility="collapsed")
+    tick_pick = st.multiselect("Tickers", sorted(ranked["ticker"].unique()),
+                               key=f"tk_{slot}", placeholder="All tickers",
                                label_visibility="collapsed")
-
-    view = df
-    for p in picks or []:
-        view = view[QUICK[p](view)]
-    if win_pick != "All windows":
-        view = view[view["window"] == win_pick]
+    view = ranked
+    for q in picks or []:
+        try:
+            view = view[QUICK[q](view)]
+        except KeyError:
+            pass
     if tick_pick:
         view = view[view["ticker"].isin(tick_pick)]
 
@@ -960,92 +1157,139 @@ def results_panel(df: pd.DataFrame) -> None:
     disp["legs"] = (disp["short_k"].map("{:g}".format) + " / "
                     + disp["long_k"].map("{:g}".format))
     disp["priced"] = disp["pricing"].map({"mid": "mid", "last": "⚠ LAST"})
-    disp = disp[["sector", "ticker", "window", "exp", "dte", "legs", "pct_otm",
-                 "width", "credit", "max_loss", "ror_pct", "annualized_pct",
-                 "short_delta", "short_iv", "short_oi", "long_oi", "priced"]]
+    disp["ba_worst"] = disp[["short_ba_pct", "long_ba_pct"]].max(axis=1)
+    if "earnings_in_window" in disp.columns:
+        known = bool(disp.get("earnings_known", pd.Series([False])).any())
+        disp["earn"] = [("—" if not known else ("none" if n == 0 else f"⚑ {int(n)}"))
+                        for n in disp["earnings_in_window"]]
+    else:
+        disp["earn"] = "—"
+    for c in ("iv_rv", "rv30"):
+        if c not in disp.columns:
+            disp[c] = None
 
     event = st.dataframe(
-        disp, width="stretch", hide_index=True, height=520,
-        key="results_table", on_select="rerun", selection_mode="single-row",
-        column_config={
-            "sector": st.column_config.ImageColumn("", width=36,
-                                                   help="Sector"),
-            "ticker": st.column_config.TextColumn("Ticker", width="small"),
-            "window": st.column_config.TextColumn("Window", width="small"),
-            "exp": st.column_config.TextColumn("Expiry", width="small"),
-            "dte": st.column_config.NumberColumn("DTE", format="%d", width="small"),
-            "legs": st.column_config.TextColumn("Short / long",
-                                                help="Short strike / long strike"),
-            "pct_otm": st.column_config.NumberColumn("% OTM", format="%.1f%%"),
-            "width": st.column_config.NumberColumn("Width", format="$%.1f"),
-            "credit": st.column_config.NumberColumn("Credit", format="$%.2f"),
-            "max_loss": st.column_config.NumberColumn("Max loss", format="$%d"),
-            "ror_pct": st.column_config.ProgressColumn(
-                "Return on risk", format="%.1f%%", min_value=0.0,
-                max_value=float(max(disp["ror_pct"].max(), 1))),
-            "annualized_pct": st.column_config.NumberColumn("Annualized",
-                                                            format="%.0f%%"),
-            "short_delta": st.column_config.NumberColumn("Δ short", format="%.3f"),
-            "short_iv": st.column_config.NumberColumn("IV short", format="%.2f"),
-            "short_oi": st.column_config.NumberColumn("OI short", format="%d"),
-            "long_oi": st.column_config.NumberColumn("OI long", format="%d"),
-            "priced": st.column_config.TextColumn(
-                "Priced", width="small",
-                help="mid = bid/ask midpoint · LAST = stale last trade"),
-        })
+        disp[TABLE_COLS], width="stretch", hide_index=True, height=460,
+        key=f"tbl_{slot}", on_select="rerun", selection_mode="multi-row",
+        column_config=table_config(disp, cross))
 
     st.html(f'<p class="payoff-note" style="margin:6px 0 0 2px">showing '
-            f'{len(view):,} of {len(df):,} · select a row for the full ticket</p>')
+            f'{len(view):,} of {len(ranked):,} · select rows for the ticket and '
+            f'aggregate exposure · at most two long legs are kept per short '
+            f'strike so one strike cannot flood the table</p>')
 
     rows = list(event.selection.rows) if event and event.selection else []
     if rows:
-        r = view.iloc[rows[0]]
-        iv = float(r["short_iv"]) if pd.notna(r["short_iv"]) else 0.35
-        spot_est = float(r["short_k"]) / (1 - r["pct_otm"] / 100)
-        st.html('<p class="section-title" style="margin-top:20px">'
-                f'{esc(r["ticker"])} · {esc(r["exp"])} · {r["short_k"]:g}/'
-                f'{r["long_k"]:g} put spread</p>')
-        left, right = st.columns([1.05, 1])
-        with left:
-            raw_html(payoff_panel(
-                "Payoff at expiration",
-                f"{int(r['dte'])}d · {SECTOR_META[sector_of(r['ticker'])][0]}",
-                payoff_svg(spot_est, float(r["short_k"]), float(r["long_k"]),
-                           float(r["credit"]), int(r["dte"]), iv,
-                           live=pd.notna(r["short_iv"]), w=600, h=232)))
-        with right:
-            badge = ('<span class="badge badge-last">last-trade priced</span>'
-                     if r["pricing"] == "last"
-                     else '<span class="badge badge-mid">midpoint priced</span>')
-            st.html(
-                '<div class="panel"><div class="kv">'
-                f'<div class="kv-item"><div class="kv-k">credit</div>'
-                f'<div class="kv-v credit">${r["credit"]:.2f}</div></div>'
-                f'<div class="kv-item"><div class="kv-k">max loss</div>'
-                f'<div class="kv-v risk">${r["max_loss"]:,.0f}</div></div>'
-                f'<div class="kv-item"><div class="kv-k">breakeven</div>'
-                f'<div class="kv-v">{float(r["short_k"]) - float(r["credit"]):,.2f}'
-                f'</div></div>'
-                f'<div class="kv-item"><div class="kv-k">return on risk</div>'
-                f'<div class="kv-v">{r["ror_pct"]:.1f}%</div></div>'
-                f'<div class="kv-item"><div class="kv-k">credit / width</div>'
-                f'<div class="kv-v">{100 * float(r["credit"]) / float(r["width"]):.0f}%'
-                f'</div></div>'
-                f'<div class="kv-item"><div class="kv-k">open interest</div>'
-                f'<div class="kv-v">{int(r["short_oi"]):,} / {int(r["long_oi"]):,}'
-                f'</div></div>'
-                f'</div><div style="margin-top:14px">{badge}</div></div>')
-        st.html('<p class="kv-k" style="margin:14px 0 4px 2px">order ticket</p>')
-        st.code(order_ticket(r), language=None, wrap_lines=True)
+        sel = view.iloc[rows]
+        if len(sel) > 1:
+            st.html('<p class="section-title" style="margin-top:18px">'
+                    'Selected exposure</p>')
+            st.html(exposure_tray(sel))
+        row_detail(sel.iloc[0], slot)
 
-    st.download_button("Download CSV", df.to_csv(index=False),
-                       f"spread_scout_{today}.csv", "text/csv",
-                       key="dl_csv", icon=":material/download:")
+    st.download_button("Download CSV", ranked.to_csv(index=False),
+                       f"spread_scout_{slot}_{today}.csv", "text/csv",
+                       key=f"dl_{slot}", icon=":material/download:")
 
 
-tab_spreads, tab_news = st.tabs(["Candidates", "News & events"])
-with tab_spreads:
-    results_panel(results)
+def row_detail(r: pd.Series, slot: str) -> None:
+    iv = float(r["short_iv"]) if pd.notna(r.get("short_iv")) else 0.35
+    spot = float(r["spot"]) if pd.notna(r.get("spot")) else \
+        float(r["short_k"]) / (1 - r["pct_otm"] / 100)
+    st.html('<p class="section-title" style="margin-top:20px">'
+            f'{esc(r["ticker"])} · {esc(r["exp"])} · {r["short_k"]:g}/'
+            f'{r["long_k"]:g} put spread</p>')
+    left, right = st.columns([1.05, 1])
+    with left:
+        raw_html(payoff_panel(
+            "Payoff at expiration",
+            f"{int(r['dte'])}d · {SECTOR_META[sector_of(r['ticker'])][0]}",
+            payoff_svg(spot, float(r["short_k"]), float(r["long_k"]),
+                       float(r["credit"]), int(r["dte"]), iv,
+                       live=pd.notna(r.get("short_iv")), w=600, h=232,
+                       otm_lo=otm_band[0] / 100, otm_hi=otm_band[1] / 100)))
+    with right:
+        badge = ('<span class="badge badge-last">last-trade priced</span>'
+                 if r["pricing"] == "last"
+                 else '<span class="badge badge-mid">midpoint priced</span>')
+        n_earn = int(r.get("earnings_in_window") or 0)
+        known = bool(r.get("earnings_known"))
+        if not known:
+            ebadge = ('<span class="badge badge-win">earnings unknown</span>')
+        elif n_earn:
+            ebadge = (f'<span class="badge badge-last">⚑ {n_earn} report'
+                      f'{"s" if n_earn > 1 else ""} in window</span>')
+        else:
+            ebadge = '<span class="badge badge-mid">no earnings in window</span>'
+        st.html(
+            '<div class="panel"><div class="kv">'
+            f'<div class="kv-item"><div class="kv-k">credit</div>'
+            f'<div class="kv-v credit">${r["credit"]:.2f}</div></div>'
+            f'<div class="kv-item"><div class="kv-k">max loss / contract</div>'
+            f'<div class="kv-v risk">${r["max_loss"]:,.0f}</div></div>'
+            f'<div class="kv-item"><div class="kv-k">breakeven</div>'
+            f'<div class="kv-v">{r["breakeven"]:,.2f}</div></div>'
+            f'<div class="kv-item"><div class="kv-k">return on risk</div>'
+            f'<div class="kv-v">{r["ror_pct"]:.1f}%</div></div>'
+            f'<div class="kv-item"><div class="kv-k">credit / width</div>'
+            f'<div class="kv-v">{100 * float(r["credit"]) / float(r["width"]):.0f}%'
+            f'</div></div>'
+            f'<div class="kv-item"><div class="kv-k">at the cap</div>'
+            f'<div class="kv-v">{int(r["contracts"])} × '
+            f'${r["total_credit"]:,.0f}</div></div>'
+            '</div>'
+            '<div class="payoff-note" style="margin-top:14px;display:grid;gap:3px">'
+            f'<span>short {r["short_k"]:g}P &nbsp; '
+            f'{_q(r.get("short_bid"))} / {_q(r.get("short_ask"))} &nbsp; '
+            f'OI {int(r["short_oi"]):,}</span>'
+            f'<span>long &nbsp;{r["long_k"]:g}P &nbsp; '
+            f'{_q(r.get("long_bid"))} / {_q(r.get("long_ask"))} &nbsp; '
+            f'OI {int(r["long_oi"]):,}</span></div>'
+            f'<div style="margin-top:12px">{badge} {ebadge}</div></div>')
+    st.html('<p class="kv-k" style="margin:14px 0 4px 2px">order ticket</p>')
+    st.code(order_ticket(r), language=None, wrap_lines=True)
+
+
+def _q(v) -> str:
+    return f"{float(v):.2f}" if v is not None and pd.notna(v) else "—"
+
+
+# The two sleeves are separate products with different risks, so they get
+# separate tables. The cross-regime tab is the only place they are compared,
+# and only on annualized return.
+present = [w for w in (WIN_SHORT, WIN_LONG) if w in set(shown["window"])]
+labels = list(present)
+if len(present) > 1:
+    labels.append("Cross-regime")
+labels.append("News & events")
+tabs = st.tabs(labels)
+
+REGIME_NOTE = {
+    WIN_SHORT: ("Theta decays fastest here, so annualized returns run higher — "
+                "but credits are small, you redeploy twelve times a year, and "
+                "at 20% OTM only high-IV names pay anything at all."),
+    WIN_LONG:  ("Bigger absolute premium and one decision instead of twelve — "
+                "paid for with months of tied-up capital, slow early theta, and "
+                "real vega risk: a volatility spike marks the position against "
+                "you long before the stock approaches your strike."),
+}
+
+for i, w in enumerate(present):
+    with tabs[i]:
+        st.html(f'<p class="section-title">{esc(w)}</p>'
+                f'<p class="sub" style="margin-bottom:12px">{REGIME_NOTE[w]}</p>')
+        render_results(shown[shown["window"] == w], slot=w[:6], cross=False)
+
+if len(present) > 1:
+    with tabs[len(present)]:
+        st.html('<p class="section-title">Cross-regime comparison</p>'
+                '<p class="sub" style="margin-bottom:12px">Both sleeves on one '
+                'annualized axis. Simple annualization assumes you redeploy at '
+                'the same terms all year, which the short sleeve has to earn '
+                'twelve times over and the far-dated sleeve does not.</p>')
+        render_results(shown, slot="cross", cross=True)
+
+tab_news = tabs[-1]
 
 # ------------------------------------------------------------ news overlay
 
@@ -1053,7 +1297,7 @@ CHIP_CLASS = {"positive": "badge-mid", "negative": "badge-last",
               "neutral": "badge-win"}
 
 with tab_news:
-    top_names = list(results["ticker"].drop_duplicates().head(8))
+    top_names = list(shown["ticker"].drop_duplicates().head(8))
     st.html('<p class="section-title">Coverage on the top names</p>'
             f'<p class="sub" style="margin-bottom:10px">Recent articles and '
             f'sentiment for the {len(top_names)} highest-ranked underlyings.</p>')
