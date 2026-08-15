@@ -84,7 +84,7 @@ SECTOR_META = {
     "other":    ("Other",       "#8A94A6"),
 }
 PRESETS = {
-    "Mega-cap tech": ["AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "META", "TSLA",
+    "Mega tech": ["AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "META", "TSLA",
                       "AVGO", "ORCL", "NFLX"],
     "Semis":         ["NVDA", "AVGO", "AMD", "MU"],
     "Financials":    ["JPM", "BAC", "GS", "V", "MA"],
@@ -527,6 +527,113 @@ def payoff_svg(spot: float, short_k: float, long_k: float, credit: float,
 </div>"""
 
 
+def cone_svg(spot: float, short_k: float, long_k: float, credit: float,
+             dte: int, iv: float, rv: float | None, r: float = 0.04,
+             q: float = 0.0, w: int = 1200, h: int = 300) -> str:
+    """The probability cone: where the stock can actually finish.
+
+    A lognormal density of terminal price at expiration, with the outcome
+    regions shaded and their probabilities labelled — so the EV column stops
+    being an assertion and becomes something you can see.
+
+    Two curves are drawn: implied vol (what the market charges) and realized
+    vol (how the stock has actually moved). The gap between them IS the
+    variance risk premium this strategy harvests. When the amber curve sits
+    inside the cyan one, the market is paying for more movement than the stock
+    has been delivering.
+    """
+    T = max(dte, 1) / 365.0
+    iv = max(float(iv or 0.35), 0.01)
+    be = short_k - credit
+    pad_l, pad_r, pad_t, pad_b = 12, 12, 40, 42
+    lo = min(long_k * 0.86, spot * math.exp((r - q - iv * iv / 2) * T
+                                            - 3.2 * iv * math.sqrt(T)))
+    hi = spot * math.exp((r - q - iv * iv / 2) * T + 3.2 * iv * math.sqrt(T))
+    lo, hi = max(lo, 0.01), max(hi, spot * 1.05)
+
+    def X(p_):
+        return pad_l + (p_ - lo) / (hi - lo) * (w - pad_l - pad_r)
+
+    def pdf(x, sigma):
+        """Lognormal density of S_T."""
+        if x <= 0:
+            return 0.0
+        mu = math.log(spot) + (r - q - sigma * sigma / 2) * T
+        sd = sigma * math.sqrt(T)
+        z = (math.log(x) - mu) / sd
+        return math.exp(-z * z / 2) / (x * sd * math.sqrt(2 * math.pi))
+
+    N = 180
+    xs = [lo + (hi - lo) * i / N for i in range(N + 1)]
+    dens_iv = [pdf(x, iv) for x in xs]
+    dens_rv = [pdf(x, rv) for x in xs] if (rv and rv > 0) else []
+    peak = max(dens_iv + (dens_rv or [0])) or 1.0
+    plot_h = h - pad_t - pad_b
+
+    def Y(d):
+        return pad_t + plot_h - (d / peak) * plot_h
+
+    def path(dens):
+        return " ".join(("M" if i == 0 else "L")
+                        + f"{X(x):.1f},{Y(d):.1f}" for i, (x, d) in
+                        enumerate(zip(xs, dens)))
+
+    def area(x0, x1, cls):
+        pts = [(x, d) for x, d in zip(xs, dens_iv) if x0 <= x <= x1]
+        if len(pts) < 2:
+            return ""
+        seg = " ".join(f"L{X(x):.1f},{Y(d):.1f}" for x, d in pts)
+        return (f'<path class="{cls}" d="M{X(pts[0][0]):.1f},{Y(0):.1f} {seg} '
+                f'L{X(pts[-1][0]):.1f},{Y(0):.1f} Z"/>')
+
+    # outcome regions, by the same maths the EV column uses
+    p_win = prob_otm(spot, short_k, T, r, q, iv)
+    p_full = 1 - prob_otm(spot, long_k, T, r, q, iv)
+    p_part = max(0.0, 1 - p_win - p_full)
+
+    def vline(x, cls, label, lab_cls="", row=0):
+        """`row` staggers the label so adjacent strikes do not collide — the
+        long strike, short strike and breakeven can sit within a few dollars
+        of each other and their labels overlapped when all shared one line."""
+        y_lab = pad_t - 26 if row else pad_t - 12
+        return (f'<line class="{cls}" x1="{X(x):.1f}" y1="{pad_t - 8:.1f}" '
+                f'x2="{X(x):.1f}" y2="{h - pad_b:.1f}" stroke-width="1"/>'
+                f'<text class="{lab_cls}" x="{X(x):.1f}" y="{y_lab:.1f}" '
+                f'text-anchor="middle">{label}</text>')
+
+    rv_curve = (f'<path class="curve-rv springy" d="{path(dens_rv)}"/>'
+                if dens_rv else "")
+    rv_note = (f"realized {rv * 100:.0f}%" if rv else "realized vol unavailable")
+    return f"""
+<svg class="cone-svg" viewBox="0 0 {w} {h}" preserveAspectRatio="xMidYMid meet"
+     role="img" aria-label="Probability of the stock finishing in each outcome
+     region at expiration">
+  {area(lo, long_k, 'area-loss')}
+  {area(long_k, short_k, 'area-part')}
+  {area(short_k, hi, 'area-win')}
+  <path class="curve-iv springy" d="{path(dens_iv)}"/>
+  {rv_curve}
+  {vline(long_k, 'kline', f'long {long_k:g}', '', 1)}
+  {vline(short_k, 'kline', f'short {short_k:g}', '', 0)}
+  {vline(be, 'kline', f'BE {be:,.2f}', 'belabel', 1)}
+  {vline(spot, 'spotline', f'spot {spot:,.2f}', '', 0)}
+  <text x="{X((short_k + hi) / 2):.1f}" y="{h - pad_b + 14:.1f}"
+        text-anchor="middle" fill="#FFB000">max profit {p_win * 100:.1f}%</text>
+  <text x="{X(max(lo, long_k * 0.94)):.1f}" y="{h - pad_b + 14:.1f}"
+        text-anchor="start" fill="#E5484D">full loss {p_full * 100:.1f}%</text>
+  <!-- the partial band is narrow by construction, so its label drops a row
+       rather than colliding with the full-loss label beside it -->
+  <text x="{X((long_k + short_k) / 2):.1f}" y="{h - pad_b + 25:.1f}"
+        text-anchor="middle" fill="#E5484D">partial {p_part * 100:.1f}%</text>
+</svg>
+<div class="payoff-note" style="display:flex;justify-content:space-between;
+     padding:4px 4px 0 4px">
+  <span><span style="color:#4FC3D9">— implied {iv * 100:.0f}%</span>
+    &nbsp; <span style="color:#FFB000">-- {esc(rv_note)}</span></span>
+  <span>the gap is the variance risk premium</span>
+</div>"""
+
+
 def payoff_panel(title: str, note: str, svg: str) -> str:
     return (f'<div class="payoff-wrap"><div class="payoff-title">'
             f'<span>{esc(title)}</span><span class="payoff-note">{esc(note)}</span>'
@@ -598,7 +705,7 @@ with st.sidebar:
         for i, (name, basket) in enumerate(PRESETS.items()):
             active = bool(basket) and set(basket) <= set(universe)
             slug = name.lower().replace(" ", "_").replace("-", "")
-            if cols[i % 2].button(("● " if active else "＋ ") + name,
+            if cols[i % 2].button(name.upper(),
                                   key=f"preset_{slug}", width="stretch",
                                   help=f"{'Remove' if active else 'Add'} "
                                        f"{len(basket)} tickers"):
@@ -609,13 +716,13 @@ with st.sidebar:
                 st.rerun()
 
         c1, c2, c3 = st.columns(3)
-        if c1.button("Clear", key="uni_clear", width="stretch"):
+        if c1.button("CLEAR", key="uni_clear", width="stretch"):
             set_universe([])
             st.rerun()
-        if c2.button("Defaults", key="uni_default", width="stretch"):
+        if c2.button("RESET", key="uni_default", width="stretch"):
             set_universe(list(DEFAULT_UNIVERSE))
             st.rerun()
-        if c3.button("Save list", key="uni_save", width="stretch",
+        if c3.button("SAVE", key="uni_save", width="stretch",
                      help="Stores the selection in the page URL so it survives "
                           "a refresh and can be bookmarked or shared."):
             st.query_params["u"] = ",".join(universe)
@@ -783,8 +890,9 @@ with st.sidebar:
     with st.container(key="runbox"):
         run = st.button("Run scan", type="primary", width="stretch",
                         key="run_scan", disabled=not universe or n_win == 0)
-        st.html(f'<div class="run-cost">{len(universe)} names · {n_chains} chains'
-                f' · est {max(1, round(n_chains * 0.45 / 60)):d}–'
+        st.html(f'<div class="run-cost">{len(universe)} names &nbsp; '
+                f'{n_chains} chains &nbsp; est '
+                f'{max(1, round(n_chains * 0.45 / 60)):d}–'
                 f'{max(2, round(n_chains * 1.1 / 60)):d} min</div>')
 
 SESSION = market_session()
@@ -983,13 +1091,14 @@ if scan is None:
     st.html(
         '<div class="legend rise d5" style="row-gap:10px">'
         '<span class="legend-item"><i class="legend-swatch" style="background:'
-        'linear-gradient(90deg,#8A6A1C,#4FD18B)"></i>return on risk, ranked '
-        'within a sleeve</span>'
+        '#FFB000"></i>return on risk, ranked within a sleeve</span>'
+        '<span class="legend-item"><span class="badge badge-win">POP</span>'
+        'N(d2) — the chance the short strike expires worthless</span>'
         '<span class="legend-item"><span class="badge badge-mid">mid</span>'
-        'both legs quoted — priced off the bid/ask midpoint</span>'
-        '<span class="legend-item"><span class="badge badge-last">⚠ last</span>'
-        'a leg had no market; priced off a stale trade. Excluded by default'
-        '</span>'
+        'both legs quoted, priced off the midpoint</span>'
+        '<span class="legend-item"><span class="badge badge-last">rejected</span>'
+        'a leg had no market, or the credit was implausible for the width — '
+        'refused before ranking, never shown as a candidate</span>'
         '<span class="legend-item"><span class="badge badge-last">⚑ 1</span>'
         'earnings reports scheduled inside the window</span>'
         '<span class="legend-item"><span class="badge badge-win">b/a 38%</span>'
@@ -1071,18 +1180,29 @@ def metrics_html(df: pd.DataFrame, rejected: int, animate: bool) -> str:
     for v in df["ror_pct"]:
         counts[min(int((v - lo) / span * bins), bins - 1)] += 1
     peak = max(counts) or 1
+    med_ror = float(df["ror_pct"].median())
+    med_pct = 100 * (med_ror - lo) / span
     bars = "".join(
-        f'<i style="flex:1 1 0;min-width:2px;border-radius:2px 2px 0 0;'
+        f'<i style="flex:1 1 0;min-width:2px;'
         f'height:{max(3, c / peak * 100):.0f}%;background:'
-        f'{"#4FD18B" if i > bins * 0.6 else "#8A6A1C"}"></i>'
+        f'{"#FFB000" if i > bins * 0.6 else "#6E4D00"}"></i>'
         for i, c in enumerate(counts))
-    spark = (f'<div class="panel panel-tight" style="grid-column:1/-1">'
-             f'<div class="kv-k">return on risk · distribution</div>'
-             f'<div style="display:flex;align-items:flex-end;gap:2px;height:34px;'
-             f'margin-top:6px">{bars}</div>'
-             f'<div class="payoff-note" style="display:flex;'
-             f'justify-content:space-between;margin-top:4px">'
-             f'<span>{lo:.1f}%</span><span>{hi:.1f}%</span></div></div>')
+    spark = (
+        f'<div class="panel panel-tight" style="grid-column:1/-1;border-right:0">'
+        f'<div class="kv-k">return on risk · distribution · '
+        f'{len(df):,} candidates</div>'
+        f'<div style="position:relative;display:flex;align-items:flex-end;'
+        f'gap:2px;height:38px;margin-top:6px">{bars}'
+        f'<span style="position:absolute;left:{med_pct:.1f}%;top:-2px;bottom:0;'
+        f'width:1px;background:#E8E6E1;opacity:.75"></span>'
+        f'<span style="position:absolute;left:{med_pct:.1f}%;top:-12px;'
+        f'transform:translateX(-50%);font-family:var(--mono);font-size:8.5px;'
+        f'color:#E8E6E1">median {med_ror:.1f}%</span></div>'
+        f'<div class="payoff-note" style="display:flex;'
+        f'justify-content:space-between;margin-top:3px">'
+        f'<span>{lo:.1f}% &nbsp;lowest</span>'
+        f'<span>count per bin</span>'
+        f'<span>highest&nbsp; {hi:.1f}%</span></div></div>')
 
     # The script is extracted and run by Streamlit, which can fire it before the
     # markup lands in the DOM — hence the retry rather than a bare query.
@@ -1193,7 +1313,7 @@ def table_config(disp: pd.DataFrame, cross: bool) -> dict:
     ror_cap = float(disp["ror_pct"].quantile(0.95)) if len(disp) else 1.0
     return {
         "pop": st.column_config.NumberColumn(
-            "POP", format="percent",
+            "POP", format="%.1f%%",
             help="N(d2): probability the short strike expires out of the "
                  "money. Not the same as 1 - |delta|."),
         "ev_per_collateral": st.column_config.NumberColumn(
@@ -1210,7 +1330,7 @@ def table_config(disp: pd.DataFrame, cross: bool) -> dict:
             "EV (IV basis)", format="$%.0f",
             help="Risk-neutral baseline. Expect ~0 minus costs."),
         "p_touch": st.column_config.NumberColumn(
-            "P(touch)", format="percent",
+            "P(touch)", format="%.1f%%",
             help="Approximate: 2 x N(-d2), driftless."),
         "short_delta": st.column_config.NumberColumn("Δ short", format="%.3f"),
         "credit_pct_width": st.column_config.NumberColumn(
@@ -1330,12 +1450,9 @@ def render_results(df: pd.DataFrame, slot: str, cross: bool,
 
     st.html(
         '<p class="payoff-note" style="margin:2px 0 10px 2px">'
-        + ('Ranked by <b>simple annualized</b> return on risk — RoR × 365 ÷ DTE, '
-           'not compounded. This is the only fair way to line the two sleeves '
-           'up against each other.'
+        + ('Ranked by <b>simple annualized</b> return on risk, not compounded.'
            if cross else
-           'Ranked by <b>return on risk</b> within this sleeve. '
-           'Compare across sleeves on the annualized tab.') + '</p>')
+           f'Ranked by <b>{esc(metric.lower())}</b> within this sleeve.') + '</p>')
 
     picks = st.pills("Quick filters", list(QUICK), selection_mode="multi",
                      key=f"qf_{slot}", label_visibility="collapsed")
@@ -1365,7 +1482,12 @@ def render_results(df: pd.DataFrame, slot: str, cross: bool,
                    for t in disp["ticker"]]
     disp["legs"] = (disp["short_k"].map("{:g}".format) + " / "
                     + disp["long_k"].map("{:g}".format))
-    disp["priced"] = disp["pricing"].map({"mid": "mid", "last": "⚠ LAST"})
+    disp["priced"] = disp["pricing"].map({"mid": "mid", "close": "close"})
+    # fixed decimals within a column — "percent" auto-format gave 81.2% next
+    # to 95.01% in the same column
+    for c, mult in (("pop", 100), ("p_touch", 100)):
+        if c in disp.columns:
+            disp[c] = disp[c] * mult
     disp["ba_worst"] = disp[["short_ba_pct", "long_ba_pct"]].max(axis=1)
     if "earnings_in_window" in disp.columns:
         known = bool(disp.get("earnings_known", pd.Series([False])).any())
@@ -1384,10 +1506,10 @@ def render_results(df: pd.DataFrame, slot: str, cross: bool,
         key=f"tbl_{slot}", on_select="rerun", selection_mode="multi-row",
         column_config=table_config(disp, cross))
 
-    st.html(f'<p class="payoff-note" style="margin:6px 0 0 2px">showing '
-            f'{len(view):,} of {len(ranked):,} · select rows for the ticket and '
-            f'aggregate exposure · at most two long legs are kept per short '
-            f'strike so one strike cannot flood the table</p>')
+    st.html(f'<p class="payoff-note" style="margin:6px 0 0 2px">'
+            f'{len(view):,} of {len(ranked):,} shown &nbsp;&nbsp; '
+            f'best per underlying and expiry &nbsp;&nbsp; '
+            f'select rows for the ticket and aggregate exposure</p>')
 
     rows = list(event.selection.rows) if event and event.selection else []
     if rows:
@@ -1412,6 +1534,12 @@ def row_detail(r: pd.Series, slot: str, scan_otm: tuple[int, int]) -> None:
     st.html('<p class="section-title" style="margin-top:20px">'
             f'{esc(r["ticker"])} · {esc(r["exp"])} · {r["short_k"]:g}/'
             f'{r["long_k"]:g} put spread</p>')
+    rv = float(r["rv30"]) if pd.notna(r.get("rv30")) else None
+    raw_html(payoff_panel(
+        "Probability cone · terminal price at expiration",
+        f"{int(r['dte'])}d · P(max profit) {100 * float(r['pop'] or 0):.1f}%",
+        cone_svg(spot, float(r["short_k"]), float(r["long_k"]),
+                 float(r["credit"]), int(r["dte"]), iv, rv)))
     left, right = st.columns([1.05, 1])
     with left:
         raw_html(payoff_panel(
@@ -1496,17 +1624,21 @@ REGIME_NOTE = {
 for i, w in enumerate(present):
     with tabs[i]:
         st.html(f'<p class="section-title">{esc(w)}</p>'
-                f'<p class="sub" style="margin-bottom:12px">{REGIME_NOTE[w]}</p>')
+                f'<p class="sub">{REGIME_NOTE[w]}</p>')
         render_results(shown[shown["window"] == w], slot=w[:6], cross=False,
                        scan_otm=scan_otm)
 
 if len(present) > 1:
     with tabs[len(present)]:
-        st.html('<p class="section-title">Cross-regime comparison</p>'
-                '<p class="sub" style="margin-bottom:12px">Both sleeves on one '
-                'annualized axis. Simple annualization assumes you redeploy at '
-                'the same terms all year, which the short sleeve has to earn '
-                'twelve times over and the far-dated sleeve does not.</p>')
+        st.html('<p class="section-title">Cross-regime</p>'
+                '<p class="sub">Both sleeves on one annualized axis.</p>')
+        with st.popover("What simple annualization assumes"):
+            st.html('<p class="sub">RoR × 365 ÷ DTE, not compounded. It '
+                    'assumes you redeploy at the same terms all year — which '
+                    'the 30–45 sleeve has to earn twelve times over, and the '
+                    'far-dated sleeve does not have to earn at all. It is the '
+                    'only way to line the two up, and it flatters the short '
+                    'sleeve. Read it as a comparison, not a forecast.</p>')
         render_results(shown, slot="cross", cross=True, scan_otm=scan_otm)
 
 tab_news = tabs[-1]
@@ -1555,7 +1687,42 @@ with tab_news:
                 f'<a href="{esc(a["url"])}" target="_blank" rel="noopener">'
                 f'{esc(a["title"])}</a></div>' for a in arts[:6]))
 
-st.html('<div style="height:26px"></div>'
-        '<p class="payoff-note">Screening tool, not investment advice. Rows '
-        'marked LAST used stale last-trade prices; verify against a live quote '
-        'before trading.</p>')
+st.html('<p class="payoff-note" style="margin-top:18px">Screening tool, not '
+        'investment advice. Nothing here is a recommendation — a candidate is '
+        'a spread that survived a filter, and quotes move.</p>')
+
+# Keyboard layer. `/` focuses search, j/k walk rows, enter expands, r runs.
+# Streamlit owns the grid, so j/k drive its own scroller rather than a custom
+# selection model — the row click remains the source of truth for selection.
+st.html("""
+<div class="keybar">
+  <span><kbd>/</kbd>search</span><span><kbd>j</kbd><kbd>k</kbd>row</span>
+  <span><kbd>&#8629;</kbd>expand</span><span><kbd>r</kbd>run scan</span>
+  <span class="spacer">SPREAD SCOUT</span>
+</div>
+<script>(function(){
+  if (window.__ss_keys) { return; }
+  window.__ss_keys = true;
+  var typing = function(e){
+    var t = e.target || {};
+    var n = (t.tagName || '').toLowerCase();
+    return n === 'input' || n === 'textarea' || t.isContentEditable;
+  };
+  document.addEventListener('keydown', function(e){
+    if (e.metaKey || e.ctrlKey || e.altKey) { return; }
+    var grid = document.querySelector('[data-testid="stDataFrame"] [role="grid"]')
+            || document.querySelector('[data-testid="stDataFrame"]');
+    if (e.key === '/' && !typing(e)) {
+      var box = document.querySelector('[data-testid="stMultiSelect"] input');
+      if (box) { e.preventDefault(); box.focus(); }
+      return;
+    }
+    if (typing(e)) { return; }
+    if (e.key === 'j' || e.key === 'k') {
+      if (grid) { e.preventDefault(); grid.scrollTop += (e.key === 'j' ? 34 : -34); }
+    } else if (e.key === 'r') {
+      var run = document.querySelector('.st-key-run_scan button');
+      if (run) { e.preventDefault(); run.click(); }
+    }
+  });
+})();</script>""", unsafe_allow_javascript=True)
