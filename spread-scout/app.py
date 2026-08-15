@@ -968,7 +968,8 @@ def tape_html(entries: list[tuple[str, int, str, str]]) -> str:
 def skeleton_html(n: int = 4, label: str | None = None) -> str:
     """Ghost of a real result row — same columns, so the preview does not
     promise a different table than the one that arrives."""
-    head = ('<div class="ghost-head"><span>ticker</span><span>short / long</span>'
+    head = ('<div class="ghost-head"><span>ticker</span>'
+            '<span>sell put / buy put</span>'
             '<span>credit</span><span>qty</span><span>max loss</span>'
             '<span>return on risk</span><span>iv/rv</span>'
             '<span>earnings</span></div>')
@@ -1351,8 +1352,13 @@ def table_config(disp: pd.DataFrame, cross: bool) -> dict:
         "spot": st.column_config.NumberColumn("Spot", format="$%.2f"),
         "exp": st.column_config.TextColumn("Expiry", width="small"),
         "dte": st.column_config.NumberColumn("DTE", format="%d", width="small"),
-        "legs": st.column_config.TextColumn("Short / long",
-                                            help="Short strike / long strike"),
+        # Spelled out rather than "short / long": this is the one column where
+        # reading the direction backwards is catastrophic rather than merely
+        # confusing, and it matches the verbs on the order ticket.
+        "legs": st.column_config.TextColumn(
+            "Sell put / buy put", width="medium",
+            help="Sell the higher strike, buy the lower one, same expiration. "
+                 "The credit is what you collect for the pair."),
         "pct_otm": st.column_config.NumberColumn("% OTM", format="%.1f%%"),
         "width": st.column_config.NumberColumn("Width", format="$%.2f"),
         "credit": st.column_config.NumberColumn("Credit", format="$%.2f"),
