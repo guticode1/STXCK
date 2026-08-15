@@ -595,6 +595,20 @@ with st.sidebar:
                 + '<span class="tick" style="left:50%">+100d</span>'
                 + '<span class="tick" style="left:98%">+200d</span></div>')
 
+        # The trade-off belongs where the choice is made, not only on the
+        # results tab you reach afterwards.
+        st.html(
+            '<div class="regime-note">'
+            + ('<span><b>30–45</b> fastest theta per day of risk, so annualized '
+               'runs higher — but small credits, twelve redeployments a year, '
+               'and only high-IV names pay at 20% OTM.</span>'
+               if use_short else '')
+            + ('<span><b>90–190</b> bigger premium and one decision — paid for '
+               'with months of tied-up capital, slow early theta, and real '
+               'vega: a vol spike marks you against long before the stock '
+               'nears your strike.</span>' if use_long else '')
+            + '</div>')
+
     # ---- strategy
     otm_state = st.session_state.get("otm_band", (18, 22))
     ml_state = st.session_state.get("risk_cap", 2200)
@@ -738,16 +752,19 @@ def tape_html(entries: list[tuple[str, int, str, str]]) -> str:
 
 
 def skeleton_html(n: int = 4, label: str | None = None) -> str:
+    """Ghost of a real result row — same columns, so the preview does not
+    promise a different table than the one that arrives."""
     head = ('<div class="ghost-head"><span>ticker</span><span>short / long</span>'
-            '<span>width</span><span>credit</span><span>max loss</span>'
-            '<span>return on risk</span><span>dte</span></div>')
+            '<span>credit</span><span>qty</span><span>max loss</span>'
+            '<span>return on risk</span><span>iv/rv</span>'
+            '<span>earnings</span></div>')
     rows = "".join(
         '<div class="ghost-row">'
         '<div class="bone w70"></div><div class="bone w85"></div>'
         '<div class="bone w50"></div><div class="bone w50"></div>'
         '<div class="bone w70"></div>'
         f'<div class="bone-bar"><i style="width:{w}%"></i></div>'
-        '<div class="bone w50"></div></div>'
+        '<div class="bone w50"></div><div class="bone w50"></div></div>'
         for w in (78, 62, 48, 36, 30)[:n])
     cap = (f'<div class="payoff-note" style="padding:8px 16px 2px">{esc(label)}</div>'
            if label else "")
@@ -862,13 +879,19 @@ if scan is None:
         'like</p></div>')
     st.html('<div class="rise d4">' + skeleton_html(5) + '</div>')
     st.html(
-        '<div class="legend rise d5">'
+        '<div class="legend rise d5" style="row-gap:10px">'
         '<span class="legend-item"><i class="legend-swatch" style="background:'
-        'linear-gradient(90deg,#8A6A1C,#4FD18B)"></i>return on risk, ranked</span>'
+        'linear-gradient(90deg,#8A6A1C,#4FD18B)"></i>return on risk, ranked '
+        'within a sleeve</span>'
         '<span class="legend-item"><span class="badge badge-mid">mid</span>'
-        'priced off the bid/ask midpoint</span>'
-        '<span class="legend-item"><span class="badge badge-last">last</span>'
-        'fell back to a stale last trade — verify before trading</span>'
+        'both legs quoted — priced off the bid/ask midpoint</span>'
+        '<span class="legend-item"><span class="badge badge-last">⚠ last</span>'
+        'a leg had no market; priced off a stale trade. Excluded by default'
+        '</span>'
+        '<span class="legend-item"><span class="badge badge-last">⚑ 1</span>'
+        'earnings reports scheduled inside the window</span>'
+        '<span class="legend-item"><span class="badge badge-win">b/a 38%</span>'
+        'widest leg as a share of mid — wide markets cost you the edge</span>'
         '</div>')
     st.stop()
 
@@ -882,13 +905,20 @@ if results.empty:
     p_ror = sparams.get("min_ror", min_ror)
     p_otm = sparams.get("otm", tuple(otm_band))
     p_oi = sparams.get("min_oi_s", min_oi_s)
+    # Name the missing high-IV names specifically — the reason a 20% buffer
+    # pays nothing is almost always that the universe is too calm, not that
+    # the filters are too tight.
+    calm = [t for t in ("TSLA", "COIN", "MSTR", "PLTR", "AMD", "MU")
+            if t not in universe][:3] or ["TSLA", "COIN", "MSTR"]
     st.html(
         '<div class="hero"><p class="eyebrow">no matches</p>'
-        f'<p class="lede">Nothing cleared a {p_ror}% return on risk.</p>'
-        f'<p class="sub">You screened {p_otm[0]}–{p_otm[1]}% below spot with a '
-        f'{p_oi}-contract open-interest floor. At short DTE, 20% OTM pays close '
-        'to nothing on calm mega caps — the premium is only there when vol is.'
-        '</p></div>'
+        f'<p class="lede">Nothing cleared a {p_ror}% return on risk at '
+        f'{p_otm[0]}–{p_otm[1]}% OTM.</p>'
+        f'<p class="sub">High-IV names pay at this distance; calm mega caps '
+        f"don't. You screened {len(universe)} names with a {p_oi}-contract "
+        'open-interest floor — at short DTE a 20% one-month drop is priced at '
+        'close to nothing unless the market already expects the stock to move '
+        'that far.</p></div>'
         '<p class="section-title">Try one of these</p>'
         '<div class="legend">'
         f'<span class="chip">widen OTM to <b>{max(10, p_otm[0] - 4)}–'
@@ -896,7 +926,7 @@ if results.empty:
         f'<span class="chip">lower min RoR to <b>{max(0, p_ror - 3)}%</b></span>'
         f'<span class="chip">drop OI floor to <b>{min(max(p_oi // 2, 0), 250)}</b>'
         f'</span>'
-        '<span class="chip">add high-IV names <b>TSLA · COIN · MSTR</b></span>'
+        f'<span class="chip">add <b>{esc(" · ".join(calm))}</b></span>'
         '</div>')
     st.stop()
 

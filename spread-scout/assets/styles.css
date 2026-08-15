@@ -364,7 +364,8 @@ h1, h2, h3, .display { font-family: var(--display) !important;
 
 /* ghost/skeleton preview row */
 .ghost-head, .ghost-row {
-  display: grid; grid-template-columns: 92px 96px 62px 62px 74px 1fr 56px;
+  display: grid;
+  grid-template-columns: 92px 96px 62px 46px 74px 1fr 56px 64px;
   gap: var(--s3); align-items: center; padding: 11px var(--s4);
 }
 .ghost-head { font-size: 10px; letter-spacing: .13em; text-transform: uppercase;
@@ -436,6 +437,13 @@ h1, h2, h3, .display { font-family: var(--display) !important;
 .meter-track { display: flex; gap: 3px; }
 .meter-seg { width: 15px; height: 5px; border-radius: 2px; background: #1E2634; }
 .meter-seg.on { background: var(--amber); }
+
+/* regime trade-off note, sidebar */
+.regime-note { display: grid; gap: 7px; margin-top: var(--s3); }
+.regime-note span { color: var(--muted); font-size: 11px; line-height: 1.5;
+  border-left: 2px solid var(--hairline); padding-left: 9px; }
+.regime-note b { color: var(--text); font-family: var(--mono);
+  font-weight: 500; font-variant-numeric: tabular-nums; }
 
 /* calendar strip */
 .calstrip { position: relative; height: 30px; margin: var(--s2) 0 var(--s1) 0; }
