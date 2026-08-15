@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import datetime as dt
 import math
+import sys
 import time
 from pathlib import Path
 from urllib.parse import quote
@@ -41,7 +42,13 @@ import pandas as pd
 import requests
 import streamlit as st
 
-from strategy import (
+# strategy.py sits next to this file. Streamlit Cloud runs the script from the
+# repo root without putting the script's own directory on sys.path, so a bare
+# `import strategy` raises ModuleNotFoundError there even though it resolves
+# locally. Bootstrap the path before importing.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from strategy import (  # noqa: E402
     BLOCK_REASON, ETF_BLOCKLIST, Params, RANK_METRICS, alternates_for,
     build_spreads, dedupe, earnings_in_window, is_blocked, market_session,
     prob_otm, rank_cross_regime, rank_within_regime, rv_from_closes,
